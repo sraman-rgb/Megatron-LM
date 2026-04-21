@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
-from ..fp8_utils import is_float8tensor, post_all_gather_processing
+from ..fp8_utils import is_float8tensor, is_nvfp4tensor, post_all_gather_processing
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
@@ -483,11 +483,10 @@ class DistributedDataParallel(_BaseDataParallel):
             bucket_group.start_param_sync(force_sync=force_sync)
 
             if not self.ddp_config.overlap_param_gather:
-                # For MXFP8 params, we need to copy the all-gathered param data from the buffer to
-                # the param.data, since param buffer is not mapped to model params for MXFP8 case.
-                # The paramaters are cast from bf16 to MXFP8 during copy.
-                # In the case of "overlap_param_gather=True", the param copy is done
-                # in "finish_param_sync" stage after zeroing the shared gardient buffers.
+                # For MXFP8/NVFP4 params, we need to copy the all-gathered param data from the
+                # buffer to param.data, since param buffer is not mapped to model params for these
+                # cases. In the case of "overlap_param_gather=True", the param copy is done
+                # in "finish_param_sync" stage after zeroing the shared gradient buffers.
                 if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                     for bucket in bucket_group.buckets:
                         for param in bucket.params:
@@ -501,6 +500,33 @@ class DistributedDataParallel(_BaseDataParallel):
                         # grad buffer, it would clear the data of those param buffers that have not
                         # yet completed AG.
                         bucket.param_data.zero_()
+                elif self.ddp_config.reuse_grad_buf_for_nvfp4_param_ag:
+                    # Quantize each param's BF16 slice from the staging buffer to NVFP4 in-place
+                    # (rowwise only), then call post_all_gather_processing to derive and fill in
+                    # the columnwise data. Existing columnwise buffers are kept so the transpose
+                    # kernel can reuse them.
+                    nvfp4_params = []
+                    for bucket in bucket_group.buckets:
+                        for param in bucket.params:
+                            param_start, param_end = bucket.param_to_index[param]
+                            bf16_slice = (
+                                bucket.param_data.view(-1)[param_start:param_end].view(param.shape)
+                            )
+                            quantizer = param._get_quantizer()
+                            quantizer.set_usage(rowwise=True, columnwise=False)
+                            quantizer.internal = True
+                            new_storage = quantizer(bf16_slice)
+                            param._rowwise_data.copy_(new_storage._rowwise_data)
+                            param._rowwise_scale_inv.copy_(new_storage._rowwise_scale_inv)
+                            if (
+                                param._amax_rowwise is not None
+                                and new_storage._amax_rowwise is not None
+                            ):
+                                param._amax_rowwise.copy_(new_storage._amax_rowwise)
+                            nvfp4_params.append(param)
+                        bucket.param_data.zero_()
+                    if nvfp4_params:
+                        post_all_gather_processing(nvfp4_params)
                 else:
                     fp8_params = []
                     for bucket in bucket_group.buckets:

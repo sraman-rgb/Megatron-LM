@@ -63,8 +63,14 @@ class DistributedDataParallelConfig:
        perform the param all-gather in fp8."""
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
-    """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
+    """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be
        set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
+
+    reuse_grad_buf_for_nvfp4_param_ag: bool = False
+    """If true, reuse the grad buffer for param AG when using nvfp4 recipe. The distributed
+       optimizer performs an out-of-place all-gather into the BF16 staging buffer (shared with
+       the grad buffer), then quantizes BF16→NVFP4 into param.data in post-AG processing.
+       Should be set to True only when fp4_recipe is nvfp4 and fp4_param is True."""
 
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
@@ -171,6 +177,11 @@ class DistributedDataParallelConfig:
         """Check the validity of the config."""
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+        if self.reuse_grad_buf_for_mxfp8_param_ag and self.reuse_grad_buf_for_nvfp4_param_ag:
+            raise ValueError(
+                "reuse_grad_buf_for_mxfp8_param_ag and reuse_grad_buf_for_nvfp4_param_ag "
+                "are mutually exclusive."
+            )
 
         if self.nccl_ub:
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):

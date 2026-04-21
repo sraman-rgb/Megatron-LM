@@ -62,6 +62,15 @@ except (ImportError, ModuleNotFoundError):
     # MXFP8Tensor not found
     HAVE_TE_MXFP8TENSOR = False
 
+# Check if Transformer Engine has NVFP4Tensor class
+
+try:
+    from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Tensor
+
+    HAVE_TE_NVFP4TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    HAVE_TE_NVFP4TENSOR = False
+
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
@@ -108,6 +117,11 @@ def is_float8tensor(tensor: torch.Tensor) -> bool:
 def is_mxfp8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine MXFP8Tensor"""
     return HAVE_TE_MXFP8TENSOR and isinstance(tensor, MXFP8Tensor)
+
+
+def is_nvfp4tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine NVFP4Tensor"""
+    return HAVE_TE_NVFP4TENSOR and isinstance(tensor, NVFP4Tensor)
 
 
 def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:

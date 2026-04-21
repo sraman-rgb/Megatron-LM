@@ -2363,6 +2363,8 @@ def _add_mixed_precision_args(parser):
                        'for lm head to fp16.')
     group.add_argument('--reuse-grad-buf-for-mxfp8-param-ag', action='store_true',
                        help='If True, reuse the grad buffer for MXFP8 parameter all-gather.')
+    group.add_argument('--reuse-grad-buf-for-nvfp4-param-ag', action='store_true',
+                       help='If True, reuse the grad buffer for NVFP4 parameter all-gather.')
 
     return parser
 
