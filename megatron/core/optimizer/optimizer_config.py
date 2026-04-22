@@ -181,7 +181,7 @@ class OptimizerConfig:
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be
        set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
 
-    reuse_grad_buf_for_nvfp4_param_ag: bool = False
+    reuse_grad_buf_for_high_precision_param_ag: bool = False
     """If true, reuse the grad buffer for param AG when using nvfp4 recipe. Should be
        set to True only when fp8_recipe is nvfp4 and fp8_param_gather is True."""
 

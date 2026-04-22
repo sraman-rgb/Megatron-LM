@@ -21,10 +21,13 @@ from megatron.core.utils import log_single_rank
 from ..fp8_utils import (
     is_float8tensor,
     is_mxfp8tensor,
-    is_nvfp4tensor,
     modify_underlying_storage,
     post_all_gather_processing,
 )
+try:
+    from transformer_engine.pytorch.quantized_tensor import QuantizedTensor as _QuantizedTensor
+except ImportError:
+    _QuantizedTensor = None
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
@@ -356,34 +359,22 @@ class _ParamAndGradBucketGroup:
                     # correspond to multiple param buffers. If we zero out the entire grad buffer,
                     # it would clear the data of those param buffers that have not yet completed AG.
                     bucket.param_data.zero_()
-            elif self.ddp_config.reuse_grad_buf_for_nvfp4_param_ag:
-                # The BF16 all-gather result sits in bucket.param_data. Quantize each param's
-                # BF16 slice to NVFP4 in-place (rowwise only), then call
-                # post_all_gather_processing to derive and fill in the columnwise data.
-                # Existing columnwise buffers are kept so the transpose kernel can reuse them.
-                nvfp4_params = []
+            elif self.ddp_config.reuse_grad_buf_for_high_precision_param_ag:
+                # The BF16 all-gather result sits in bucket.param_data. Copy BF16 into each
+                # quantized param; QuantizedTensor.quantize_() handles quantization internally,
+                # producing a fully valid tensor ready for use (no post_all_gather_processing
+                # needed since we are not coming out of a low-precision all-gather).
                 for bucket in self.buckets:
                     for param in bucket.params:
-                        assert is_nvfp4tensor(param), (
-                            "reuse_grad_buf_for_nvfp4_param_ag requires all params to be "
-                            f"NVFP4Tensor, got {type(param)}"
-                        )
                         param_start, param_end = bucket.param_to_index[param]
                         bf16_slice = (
                             bucket.param_data.view(-1)[param_start:param_end].view(param.shape)
                         )
-                        quantizer = param._get_quantizer()
-                        quantizer.set_usage(rowwise=True, columnwise=False)
-                        quantizer.internal = True
-                        new_storage = quantizer(bf16_slice)
-                        param._rowwise_data.copy_(new_storage._rowwise_data)
-                        param._rowwise_scale_inv.copy_(new_storage._rowwise_scale_inv)
-                        if param._amax_rowwise is not None and new_storage._amax_rowwise is not None:
-                            param._amax_rowwise.copy_(new_storage._amax_rowwise)
-                        nvfp4_params.append(param)
+                        if _QuantizedTensor is not None and isinstance(param, _QuantizedTensor):
+                            param.quantize_(bf16_slice)
+                        else:
+                            param.data.copy_(bf16_slice.view(param.data.shape))
                     bucket.param_data.zero_()
-                if nvfp4_params:
-                    post_all_gather_processing(nvfp4_params)
             else:
                 fp8_params = []
                 for bucket in self.buckets:
@@ -849,10 +840,10 @@ class _ParamAndGradBuffer:
         cur_bucket_id = 0
         for param in params[::-1]:
             param_start_index, param_end_index, bucket_id = self.param_index_map[param]
-            # For MXFP8/NVFP4 params: we only need to map weight gradients to the buffer.
+            # For MXFP8/quantized params: we only need to map weight gradients to the buffer.
             if not (
                 self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-                or self.ddp_config.reuse_grad_buf_for_nvfp4_param_ag
+                or self.ddp_config.reuse_grad_buf_for_high_precision_param_ag
             ):
                 # Assign param.data to appropriate segment of self.param_data.
                 if self.param_data is not None:

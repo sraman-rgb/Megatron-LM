@@ -579,7 +579,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if not self.is_stub_optimizer:
             if (
                 self.config.reuse_grad_buf_for_mxfp8_param_ag
-                or self.config.reuse_grad_buf_for_nvfp4_param_ag
+                or self.config.reuse_grad_buf_for_high_precision_param_ag
             ):
                 # In the case of overlap_param_gather,
                 # copy is manually called in the training loop

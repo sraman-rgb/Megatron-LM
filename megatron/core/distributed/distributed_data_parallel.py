@@ -136,7 +136,16 @@ class DistributedDataParallel(_BaseDataParallel):
                 assert param.requires_grad
 
                 param_dtype = param.dtype
-                if is_float8tensor(param):
+                if (
+                    self.ddp_config.reuse_grad_buf_for_high_precision_param_ag
+                    and is_nvfp4tensor(param)
+                ):
+                    # NVFP4Tensor.dtype is bfloat16 (nominal), and AllGather is done in BF16.
+                    # Use BF16 for the staging buffer so param.quantize_(bf16_slice) works.
+                    # Must be checked before is_float8tensor() because in TE2.x, is_float8tensor
+                    # returns True for all QuantizedTensors (including NVFP4Tensor).
+                    param_dtype = torch.bfloat16
+                elif is_float8tensor(param):
                     # Currently TE's Float8Tensor is a wrapper of torch.Tensor. It has a "fake"
                     # dtype (usually a higher precision dtype such as bfloat16), but its actual
                     # data is stored in the form of a torch uint8 tensor within the Float8Tensor's
@@ -500,33 +509,20 @@ class DistributedDataParallel(_BaseDataParallel):
                         # grad buffer, it would clear the data of those param buffers that have not
                         # yet completed AG.
                         bucket.param_data.zero_()
-                elif self.ddp_config.reuse_grad_buf_for_nvfp4_param_ag:
-                    # Quantize each param's BF16 slice from the staging buffer to NVFP4 in-place
-                    # (rowwise only), then call post_all_gather_processing to derive and fill in
-                    # the columnwise data. Existing columnwise buffers are kept so the transpose
-                    # kernel can reuse them.
-                    nvfp4_params = []
+                elif self.ddp_config.reuse_grad_buf_for_high_precision_param_ag:
+                    # Copy BF16 slice into each quantized param; QuantizedTensor.quantize_()
+                    # handles quantization internally, producing a fully valid tensor ready for use.
                     for bucket in bucket_group.buckets:
                         for param in bucket.params:
                             param_start, param_end = bucket.param_to_index[param]
                             bf16_slice = (
                                 bucket.param_data.view(-1)[param_start:param_end].view(param.shape)
                             )
-                            quantizer = param._get_quantizer()
-                            quantizer.set_usage(rowwise=True, columnwise=False)
-                            quantizer.internal = True
-                            new_storage = quantizer(bf16_slice)
-                            param._rowwise_data.copy_(new_storage._rowwise_data)
-                            param._rowwise_scale_inv.copy_(new_storage._rowwise_scale_inv)
-                            if (
-                                param._amax_rowwise is not None
-                                and new_storage._amax_rowwise is not None
-                            ):
-                                param._amax_rowwise.copy_(new_storage._amax_rowwise)
-                            nvfp4_params.append(param)
+                            if isinstance(param, torch.Tensor) and hasattr(param, 'quantize_'):
+                                param.quantize_(bf16_slice)
+                            else:
+                                param.data.copy_(bf16_slice.view(param.data.shape))
                         bucket.param_data.zero_()
-                    if nvfp4_params:
-                        post_all_gather_processing(nvfp4_params)
                 else:
                     fp8_params = []
                     for bucket in bucket_group.buckets:
