@@ -4,6 +4,7 @@ import fnmatch
 import functools
 import logging
 import math
+import os
 import warnings
 from contextlib import nullcontext
 from enum import Enum
@@ -32,6 +33,27 @@ from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
 
 logger = logging.getLogger(__name__)
+
+
+def _cuda_memory_trace_suffix() -> str:
+    """Return CUDA memory stats for debug trace lines."""
+    if not torch.cuda.is_available():
+        return " cuda_available=False"
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return " cuda_memory=skipped_stream_capture"
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+    except RuntimeError as exc:
+        return f" cuda_memory_error={type(exc).__name__}"
+    gib = 1024**3
+    return (
+        f" cuda_allocated_gib={torch.cuda.memory_allocated() / gib:.3f}"
+        f" cuda_max_allocated_gib={torch.cuda.max_memory_allocated() / gib:.3f}"
+        f" cuda_reserved_gib={torch.cuda.memory_reserved() / gib:.3f}"
+        f" cuda_free_gib={free_bytes / gib:.3f}"
+        f" cuda_total_gib={total_bytes / gib:.3f}"
+    )
+
 
 try:
     if is_torch_min_version("1.13.0"):
@@ -99,6 +121,10 @@ class _ParamAndGradBucket:
         bucket_id: int,
         param_index_map: Dict[torch.nn.Parameter, tuple],
         params_with_extra_main_grads: List[torch.nn.Parameter],
+        nvfp4_reuse_param_data: Optional[torch.Tensor] = None,
+        nvfp4_reuse_grad_data: Optional[torch.Tensor] = None,
+        param_data_index_map: Optional[Dict[torch.nn.Parameter, tuple]] = None,
+        param_data_offset: int = 0,
     ):
         self.params_list = params
         self.params = set(params)
@@ -117,7 +143,21 @@ class _ParamAndGradBucket:
         for param in params:
             global_start, global_end, _ = param_index_map[param]
             self.param_to_index[param] = (global_start - offset, global_end - offset)
+        self.param_to_param_data_index = {}
+        if param_data_index_map is not None:
+            for param in params:
+                if param not in param_data_index_map:
+                    continue
+                global_start, global_end, _ = param_data_index_map[param]
+                self.param_to_param_data_index[param] = (
+                    global_start - param_data_offset,
+                    global_end - param_data_offset,
+                )
         self.params_with_extra_main_grads = params_with_extra_main_grads
+        self.nvfp4_reuse_param_data = nvfp4_reuse_param_data
+        self.nvfp4_reuse_grad_data = nvfp4_reuse_grad_data
+        self.nvfp4_reuse_param_source_ready = False
+        self.nvfp4_reuse_param_source = "unset"
 
         # Layer-wise optimizer attributes for async param gather.
         self.layerwise_params_list = None
@@ -243,9 +283,270 @@ class _ParamAndGradBucketGroup:
         # or bucket.grad_data.
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
+        self.cached_nvfp4_reuse_param_buffer_shard_list = [None] * len(self.buckets)
+        self.cached_nvfp4_reuse_grad_buffer_shard_list = [None] * len(self.buckets)
+        self._nvfp4_reuse_param_compare_prints = 0
+        self._nvfp4_reuse_grad_compare_prints = 0
+        self._nvfp4_reuse_trace_prints = 0
         # Track grad mode used to create cached param views. Rebuild if mode changes to avoid
         # mixing no_grad-created views with in-place updates in grad-enabled mode.
         self._cached_param_buffer_shards_grad_enabled = None
+
+    def _nvfp4_reuse_param_ag_enabled(self) -> bool:
+        return (
+            self.ddp_config.reuse_grad_buf_for_nvfp4_param_ag
+            and any(bucket.nvfp4_reuse_param_data is not None for bucket in self.buckets)
+        )
+
+    def _nvfp4_reuse_validation_enabled(self) -> bool:
+        return self._nvfp4_reuse_param_ag_enabled() and not self._is_current_stream_capturing()
+
+    def _nvfp4_reuse_grad_compare_enabled(self) -> bool:
+        if not self._nvfp4_reuse_validation_enabled():
+            return False
+        if self.ddp_config.reduce_scatter_with_fp32_accumulation:
+            return False
+        for bucket in self.buckets:
+            if bucket.nvfp4_reuse_grad_data is None:
+                continue
+            if bucket.nvfp4_reuse_grad_data.data_ptr() == bucket.grad_data.data_ptr():
+                return False
+        return True
+
+    @staticmethod
+    def _is_current_stream_capturing() -> bool:
+        try:
+            return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        except RuntimeError:
+            return True
+
+    @staticmethod
+    def _debug_rank() -> int:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank()
+        return 0
+
+    @staticmethod
+    def _compare_tensors(lhs: torch.Tensor, rhs: torch.Tensor) -> tuple[bool, str]:
+        if lhs.shape != rhs.shape or lhs.dtype != rhs.dtype or lhs.device != rhs.device:
+            return (
+                False,
+                f"shape/dtype/device {lhs.shape}/{lhs.dtype}/{lhs.device} vs "
+                f"{rhs.shape}/{rhs.dtype}/{rhs.device}",
+            )
+        equal = torch.equal(lhs, rhs)
+        if equal:
+            return True, f"numel={lhs.numel()} dtype={lhs.dtype}"
+        mismatch_count = torch.count_nonzero(lhs != rhs).item()
+        if lhs.is_floating_point():
+            max_abs = (lhs - rhs).abs().max().item()
+        else:
+            max_abs = (lhs.to(torch.int16) - rhs.to(torch.int16)).abs().max().item()
+        return False, f"numel={lhs.numel()} mismatches={mismatch_count} max_abs={max_abs}"
+
+    def _maybe_print_nvfp4_reuse_compare(self, kind: str, bucket: _ParamAndGradBucket, match: bool, detail: str):
+        max_prints = int(os.getenv("NVFP4_REUSE_GRAD_BUF_COMPARE_PRINTS", "16"))
+        counter_name = (
+            "_nvfp4_reuse_param_compare_prints"
+            if kind == "bf16_param_ag"
+            else "_nvfp4_reuse_grad_compare_prints"
+        )
+        counter = getattr(self, counter_name)
+        if counter < max_prints:
+            setattr(self, counter_name, counter + 1)
+            print(
+                f"[NVFP4_REUSE_GRAD_BUF_COMPARE] rank={self._debug_rank()} "
+                f"kind={kind} bucket={bucket.bucket_id} match={match} {detail}",
+                flush=True,
+            )
+        strict = os.getenv("NVFP4_REUSE_GRAD_BUF_COMPARE_STRICT", "1").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if strict and not match:
+            raise RuntimeError(
+                f"NVFP4 grad-buffer reuse validation failed for {kind} "
+                f"bucket={bucket.bucket_id}: {detail}"
+            )
+
+    def _maybe_print_nvfp4_reuse_trace(
+        self, event: str, bucket: _ParamAndGradBucket, detail: str
+    ) -> None:
+        max_prints = int(os.getenv("NVFP4_REUSE_GRAD_BUF_TRACE_PRINTS", "0"))
+        if max_prints <= 0 or self._nvfp4_reuse_trace_prints >= max_prints:
+            return
+        self._nvfp4_reuse_trace_prints += 1
+        print(
+            f"[NVFP4_REUSE_GRAD_BUF_TRACE] rank={self._debug_rank()} "
+            f"event={event} bucket={bucket.bucket_id} {detail}"
+            f"{_cuda_memory_trace_suffix()}",
+            flush=True,
+        )
+
+    def _compare_nvfp4_reuse_param_ag(self) -> None:
+        if not self._nvfp4_reuse_validation_enabled():
+            return
+        if self._is_current_stream_capturing():
+            return
+        for bucket in self.buckets:
+            if bucket.nvfp4_reuse_param_data is None:
+                continue
+            if (
+                bucket.param_data is None
+                or bucket.param_data.numel() != bucket.nvfp4_reuse_param_data.numel()
+            ):
+                continue
+            match, detail = self._compare_tensors(
+                bucket.param_data, bucket.nvfp4_reuse_param_data
+            )
+            detail = f"source={bucket.nvfp4_reuse_param_source} {detail}"
+            self._maybe_print_nvfp4_reuse_compare("bf16_param_ag", bucket, match, detail)
+            bucket.nvfp4_reuse_param_data.zero_()
+            bucket.nvfp4_reuse_param_source_ready = False
+            bucket.nvfp4_reuse_param_source = "cleared"
+
+    @staticmethod
+    def _bucket_param_view(
+        bucket: _ParamAndGradBucket, buffer: torch.Tensor, param: torch.nn.Parameter
+    ) -> torch.Tensor:
+        param_start, param_end = bucket.param_to_index[param]
+        return buffer.view(-1)[param_start:param_end].view(param.data.shape)
+
+    def _copy_bucket_param_sources_to_nvfp4_reuse_shard(
+        self, bucket: _ParamAndGradBucket, reuse_local_data_view: torch.Tensor
+    ) -> tuple[int, int]:
+        """Populate a local AG input shard from persistent param_data or standalone param.data."""
+        reuse_local_data_view.zero_()
+        shard_start = (
+            self.intra_distributed_optimizer_instance_rank * reuse_local_data_view.numel()
+        )
+        shard_end = shard_start + reuse_local_data_view.numel()
+        copied_from_param_data = 0
+        copied_from_standalone_param = 0
+
+        for param in bucket.params_list:
+            param_start, param_end = bucket.param_to_index[param]
+            overlap_start = max(param_start, shard_start)
+            overlap_end = min(param_end, shard_end)
+            if overlap_end <= overlap_start:
+                continue
+
+            dest = reuse_local_data_view.view(-1)[
+                overlap_start - shard_start : overlap_end - shard_start
+            ]
+            param_offset_start = overlap_start - param_start
+            param_offset_end = overlap_end - param_start
+            param_data_index = bucket.param_to_param_data_index.get(param)
+
+            if param_data_index is not None:
+                param_data_start, _ = param_data_index
+                source = bucket.param_data.view(-1)[
+                    param_data_start + param_offset_start : param_data_start + param_offset_end
+                ]
+                copied_from_param_data += dest.numel()
+            else:
+                source = param.data.detach().view(-1)[param_offset_start:param_offset_end]
+                copied_from_standalone_param += dest.numel()
+
+            dest.copy_(source)
+
+        return copied_from_param_data, copied_from_standalone_param
+
+    def _finish_nvfp4_reuse_param_ag(self) -> bool:
+        if not self._nvfp4_reuse_param_ag_enabled():
+            return False
+        for bucket in self.buckets:
+            if bucket.nvfp4_reuse_param_data is None:
+                continue
+            source = bucket.nvfp4_reuse_param_source
+            param_count = 0
+            copied_param_count = 0
+            skipped_param_data_copy_count = 0
+            unmapped_param_data_count = 0
+            dropped_persistent_param_data_count = 0
+            refreshed_quantized_weight_count = 0
+            for param in bucket.params_list:
+                gathered_param = self._bucket_param_view(
+                    bucket, bucket.nvfp4_reuse_param_data, param
+                )
+                param_count += 1
+                if getattr(param, "_fp4_megatron_param_data_unmapped_from_ddp_buffer", False):
+                    unmapped_param_data_count += 1
+                if getattr(param, "_fp4_megatron_persistent_param_data_dropped", False):
+                    dropped_persistent_param_data_count += 1
+                refresh_cache = getattr(
+                    param, "_fp4_megatron_refresh_weight_cache_from_all_gather", None
+                )
+                if refresh_cache is not None:
+                    param._fp4_megatron_weight_cache_ag_source = (
+                        f"nvfp4_reuse:{source}"
+                    )
+                    refresh_cache(gathered_param)
+                    refreshed_quantized_weight_count += 1
+
+                skip_param_data_copy = False
+                skip_param_data_copy_hook = getattr(
+                    param, "_fp4_megatron_skip_param_data_copy_after_all_gather", None
+                )
+                if skip_param_data_copy_hook is not None:
+                    skip_param_data_copy = skip_param_data_copy_hook()
+                if skip_param_data_copy:
+                    skipped_param_data_copy_count += 1
+                else:
+                    param.data.copy_(gathered_param)
+                    copied_param_count += 1
+
+            if self._nvfp4_reuse_validation_enabled():
+                detail = (
+                    f"source={source} mode=actual "
+                    f"numel={bucket.nvfp4_reuse_param_data.numel()} "
+                    f"dtype={bucket.nvfp4_reuse_param_data.dtype}"
+                )
+                self._maybe_print_nvfp4_reuse_compare("bf16_param_ag", bucket, True, detail)
+            output_aliases_grad_buffer = (
+                bucket.nvfp4_reuse_grad_data is not None
+                and bucket.nvfp4_reuse_grad_data.data_ptr() == bucket.grad_data.data_ptr()
+                and bucket.nvfp4_reuse_param_data.data_ptr() == bucket.grad_data.data_ptr()
+            )
+            self._maybe_print_nvfp4_reuse_trace(
+                "finish",
+                bucket,
+                f"source={source} mode=actual "
+                f"output_aliases_grad_buffer={output_aliases_grad_buffer} "
+                f"params={param_count} copied_params={copied_param_count} "
+                f"skipped_param_data_copies={skipped_param_data_copy_count} "
+                f"unmapped_param_data={unmapped_param_data_count} "
+                f"dropped_persistent_param_data={dropped_persistent_param_data_count} "
+                f"refreshed_quantized_weights={refreshed_quantized_weight_count} "
+                f"zeroed_grad_buffer=True",
+            )
+            bucket.grad_data.zero_()
+            bucket.nvfp4_reuse_param_source_ready = False
+            bucket.nvfp4_reuse_param_source = "cleared"
+        return True
+
+    def _compare_nvfp4_reuse_grad_sync(self) -> None:
+        if not self._nvfp4_reuse_grad_compare_enabled():
+            return
+        if self._is_current_stream_capturing():
+            return
+        for bucket in self.buckets:
+            if bucket.nvfp4_reuse_grad_data is None:
+                continue
+            match, detail = self._compare_tensors(bucket.grad_data, bucket.nvfp4_reuse_grad_data)
+            self._maybe_print_nvfp4_reuse_compare("grad_sync", bucket, match, detail)
+
+    def _refresh_fp4_weight_cache_from_all_gather(self):
+        for bucket in self.buckets:
+            for param in bucket.params_list:
+                refresh_cache = getattr(
+                    param, "_fp4_megatron_refresh_weight_cache_from_all_gather", None
+                )
+                if refresh_cache is not None:
+                    param._fp4_megatron_weight_cache_ag_source = "param_buffer"
+                    refresh_cache(param.data)
 
     def reset(self):
         """
@@ -317,6 +618,8 @@ class _ParamAndGradBucketGroup:
             if self.param_gather_handle is not None:
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
+                if not self._finish_nvfp4_reuse_param_ag():
+                    self._refresh_fp4_weight_cache_from_all_gather()
                 return
         else:
             assert self.param_gather_handle is None
@@ -398,6 +701,7 @@ class _ParamAndGradBucketGroup:
                         for updated_p, model_p in zip(updated_params, params):
                             model_p.data.copy_(updated_p)
                     bucket.layerwise_gather_list = None
+                self._refresh_fp4_weight_cache_from_all_gather()
                 self.param_gather_handle = None
 
         else:
@@ -408,25 +712,99 @@ class _ParamAndGradBucketGroup:
                 self.intra_distributed_optimizer_instance_group, async_ops=async_op
             ) as cm:
                 for idx, bucket in enumerate(self.buckets):
-                    if self.cached_param_buffer_shard_list[idx] is None:
-                        self.cached_param_buffer_shard_list[idx] = shard_buffer(
-                            bucket.param_data, self.intra_distributed_optimizer_instance_size
+                    if (
+                        self._nvfp4_reuse_param_ag_enabled()
+                        and bucket.nvfp4_reuse_param_data is not None
+                    ):
+                        if self.cached_nvfp4_reuse_param_buffer_shard_list[idx] is None:
+                            self.cached_nvfp4_reuse_param_buffer_shard_list[idx] = shard_buffer(
+                                bucket.nvfp4_reuse_param_data,
+                                self.intra_distributed_optimizer_instance_size,
+                            )
+                        reuse_local_data_view = self.cached_nvfp4_reuse_param_buffer_shard_list[
+                            idx
+                        ][self.intra_distributed_optimizer_instance_rank]
+                        uses_shared_source = (
+                            self.ddp_config.overlap_param_gather
+                            and bucket.nvfp4_reuse_param_source_ready
                         )
-                    local_data_view = self.cached_param_buffer_shard_list[idx][
-                        self.intra_distributed_optimizer_instance_rank
-                    ]
-                    dist_all_gather_func(
-                        bucket.param_data,
-                        local_data_view,
-                        group=self.intra_distributed_optimizer_instance_group,
-                        async_op=async_op,
-                    )
+                        bucket.nvfp4_reuse_direct_copy_param_data_numel = 0
+                        bucket.nvfp4_reuse_direct_copy_standalone_param_numel = 0
+                        if not uses_shared_source:
+                            if self.ddp_config.overlap_param_gather:
+                                raise RuntimeError(
+                                    "NVFP4 grad-buffer reuse param AG requires a prepared "
+                                    "shared-buffer source when overlap_param_gather=True. "
+                                    "Call _copy_main_params_to_nvfp4_reuse_param_buffer() "
+                                    "before dispatching param all-gather."
+                                )
+                            (
+                                copied_from_param_data,
+                                copied_from_standalone_param,
+                            ) = self._copy_bucket_param_sources_to_nvfp4_reuse_shard(
+                                bucket, reuse_local_data_view
+                            )
+                            bucket.nvfp4_reuse_param_source = "direct_copy"
+                            if copied_from_standalone_param > 0:
+                                bucket.nvfp4_reuse_param_source = (
+                                    "direct_copy:param_data+standalone_param"
+                                )
+                            bucket.nvfp4_reuse_direct_copy_param_data_numel = (
+                                copied_from_param_data
+                            )
+                            bucket.nvfp4_reuse_direct_copy_standalone_param_numel = (
+                                copied_from_standalone_param
+                            )
+                        output_aliases_grad_buffer = (
+                            bucket.nvfp4_reuse_grad_data is not None
+                            and bucket.nvfp4_reuse_grad_data.data_ptr()
+                            == bucket.grad_data.data_ptr()
+                            and bucket.nvfp4_reuse_param_data.data_ptr()
+                            == bucket.grad_data.data_ptr()
+                        )
+                        self._maybe_print_nvfp4_reuse_trace(
+                            "dispatch",
+                            bucket,
+                            f"output=reuse_param_data "
+                            f"output_aliases_grad_buffer={output_aliases_grad_buffer} "
+                            f"source={bucket.nvfp4_reuse_param_source} "
+                            f"source_ready={bucket.nvfp4_reuse_param_source_ready} "
+                            f"uses_shared_source={uses_shared_source} "
+                            f"direct_copy_param_data_numel="
+                            f"{getattr(bucket, 'nvfp4_reuse_direct_copy_param_data_numel', 0)} "
+                            f"direct_copy_standalone_param_numel="
+                            f"{getattr(bucket, 'nvfp4_reuse_direct_copy_standalone_param_numel', 0)} "
+                            f"async={async_op} force_sync={force_sync}",
+                        )
+                        dist_all_gather_func(
+                            bucket.nvfp4_reuse_param_data,
+                            reuse_local_data_view,
+                            group=self.intra_distributed_optimizer_instance_group,
+                            async_op=async_op,
+                        )
+                    else:
+                        if self.cached_param_buffer_shard_list[idx] is None:
+                            self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                                bucket.param_data,
+                                self.intra_distributed_optimizer_instance_size,
+                            )
+                        local_data_view = self.cached_param_buffer_shard_list[idx][
+                            self.intra_distributed_optimizer_instance_rank
+                        ]
+                        dist_all_gather_func(
+                            bucket.param_data,
+                            local_data_view,
+                            group=self.intra_distributed_optimizer_instance_group,
+                            async_op=async_op,
+                        )
             if async_op:
                 self.param_gather_handle = cm
             else:
                 # When using `_coalescing_manager`, even if a synchronous op
                 # (async_op=False) is used, `cm` is not None. Manually set to None for
                 # consistency with prior code.
+                if not self._finish_nvfp4_reuse_param_ag():
+                    self._refresh_fp4_weight_cache_from_all_gather()
                 self.param_gather_handle = None
         self.param_gather_dispatched = True
 
@@ -516,6 +894,8 @@ class _ParamAndGradBucketGroup:
                             fp8_params.append(param)
                 if len(fp8_params) > 0:
                     post_all_gather_processing(fp8_params)
+            if not self._finish_nvfp4_reuse_param_ag():
+                self._refresh_fp4_weight_cache_from_all_gather()
 
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
@@ -554,6 +934,11 @@ class _ParamAndGradBucketGroup:
         for bucket in self.buckets:
             if bucket.gradient_scaling_factor != 1.0:
                 bucket.grad_data *= bucket.gradient_scaling_factor
+        do_nvfp4_reuse_grad_compare = self._nvfp4_reuse_grad_compare_enabled()
+        if do_nvfp4_reuse_grad_compare:
+            for bucket in self.buckets:
+                if bucket.nvfp4_reuse_grad_data is not None:
+                    bucket.nvfp4_reuse_grad_data.copy_(bucket.grad_data)
 
         # Decide reduce_op.
         reduce_op = torch.distributed.ReduceOp.SUM
@@ -611,6 +996,25 @@ class _ParamAndGradBucketGroup:
                         group=communication_group,
                         async_op=async_op,
                     )
+                    if (
+                        do_nvfp4_reuse_grad_compare
+                        and bucket.nvfp4_reuse_grad_data is not None
+                    ):
+                        if self.cached_nvfp4_reuse_grad_buffer_shard_list[idx] is None:
+                            self.cached_nvfp4_reuse_grad_buffer_shard_list[idx] = shard_buffer(
+                                bucket.nvfp4_reuse_grad_data,
+                                self.intra_distributed_optimizer_instance_size,
+                            )
+                        reuse_local_data_view = self.cached_nvfp4_reuse_grad_buffer_shard_list[
+                            idx
+                        ][self.intra_distributed_optimizer_instance_rank]
+                        dist_reduce_scatter_func(
+                            reuse_local_data_view,
+                            bucket.nvfp4_reuse_grad_data,
+                            op=reduce_op,
+                            group=communication_group,
+                            async_op=async_op,
+                        )
                 else:
                     if torch.distributed.get_rank() == 0 and force_all_reduce:
                         logger.info(
@@ -619,6 +1023,16 @@ class _ParamAndGradBucketGroup:
                     torch.distributed.all_reduce(
                         bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
                     )
+                    if (
+                        do_nvfp4_reuse_grad_compare
+                        and bucket.nvfp4_reuse_grad_data is not None
+                    ):
+                        torch.distributed.all_reduce(
+                            bucket.nvfp4_reuse_grad_data,
+                            op=reduce_op,
+                            group=communication_group,
+                            async_op=async_op,
+                        )
 
         # With multiple DistOpt instances, we need to all-reduce across instances.
         if (
@@ -648,6 +1062,24 @@ class _ParamAndGradBucketGroup:
                         group=self.inter_distributed_optimizer_instance_group,
                         async_op=async_op,
                     )
+                    if (
+                        do_nvfp4_reuse_grad_compare
+                        and bucket.nvfp4_reuse_grad_data is not None
+                    ):
+                        if self.cached_nvfp4_reuse_grad_buffer_shard_list[idx] is None:
+                            self.cached_nvfp4_reuse_grad_buffer_shard_list[idx] = shard_buffer(
+                                bucket.nvfp4_reuse_grad_data,
+                                self.intra_distributed_optimizer_instance_size,
+                            )
+                        reuse_local_data_view = self.cached_nvfp4_reuse_grad_buffer_shard_list[
+                            idx
+                        ][self.intra_distributed_optimizer_instance_rank]
+                        torch.distributed.all_reduce(
+                            reuse_local_data_view,
+                            op=reduce_op,
+                            group=self.inter_distributed_optimizer_instance_group,
+                            async_op=async_op,
+                        )
 
         if async_op:
             if self.ddp_config.reduce_scatter_with_fp32_accumulation and not force_all_reduce:
@@ -666,6 +1098,11 @@ class _ParamAndGradBucketGroup:
             # which case the torch.distributed._reduce_scatter_base() will return None. In order to
             # maintain consistency with prior code, we need to manually set communication handle to
             # None.
+            if not (
+                self.ddp_config.num_distributed_optimizer_instances > 1
+                and self.ddp_config.overlap_grad_reduce
+            ):
+                self._compare_nvfp4_reuse_grad_sync()
             self.grad_reduce_handle = None
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
@@ -692,6 +1129,7 @@ class _ParamAndGradBucketGroup:
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             torch.cuda.current_stream().wait_stream(self.communication_stream)
+            self._compare_nvfp4_reuse_grad_sync()
             self._copy_back_extra_main_grads()
             return
         assert self.grad_reduce_handle is not None, (
@@ -701,6 +1139,7 @@ class _ParamAndGradBucketGroup:
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
+        self._compare_nvfp4_reuse_grad_sync()
         self._copy_back_extra_main_grads()
 
     def free_overlap_buffers(self):
@@ -827,6 +1266,7 @@ class _ParamAndGradBuffer:
         self.buckets = []
         self.param_to_bucket = {}  # Param -> bucket mapping.
         self.param_index_map = {}  # Param -> location in buffer mapping (used in dist. optimizer).
+        self.param_data_index_map = {}  # Param -> location in persistent param_data.
 
         def _pad(number_to_be_padded: int, divisor: int) -> int:
             return int(math.ceil(number_to_be_padded / divisor) * divisor)
@@ -866,8 +1306,11 @@ class _ParamAndGradBuffer:
         # might need to be padded as well (if using the distributed optimizer).
         param_start_index = 0
         bucket_start_index = param_start_index
+        param_data_start_index = 0
+        param_data_bucket_start_index = param_data_start_index
         bucket_params = set()
         self.bucket_indices = []
+        self.param_data_bucket_indices = []
         per_bucket_numel_unpadded = []
         bucket_id = 0
 
@@ -876,13 +1319,20 @@ class _ParamAndGradBuffer:
             Record metadata for the bucket starting at bucket_start_index and ending with the
             passed-in param_end_index. Returns the bucket's end_index.
             """
-            nonlocal bucket_start_index, bucket_params, bucket_id
+            nonlocal bucket_start_index, param_data_start_index, param_data_bucket_start_index
+            nonlocal bucket_params, bucket_id
             per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
             bucket_end_index = _pad_end_of_bucket_if_needed(param_end_index)
+            param_data_bucket_end_index = _pad_end_of_bucket_if_needed(param_data_start_index)
 
             # Record metadata of new bucket.
             self.bucket_indices.append((bucket_start_index, bucket_end_index))
+            self.param_data_bucket_indices.append(
+                (param_data_bucket_start_index, param_data_bucket_end_index)
+            )
             bucket_start_index = bucket_end_index
+            param_data_start_index = param_data_bucket_end_index
+            param_data_bucket_start_index = param_data_bucket_end_index
 
             # Prepare for next bucket.
             bucket_params = set()
@@ -902,6 +1352,16 @@ class _ParamAndGradBuffer:
             return (
                 getattr(param, "shared_embedding", False)
                 and self.ddp_config.use_distributed_optimizer
+            )
+
+        def _drop_persistent_param_data_for_param(param: torch.nn.Parameter) -> bool:
+            drop_hook = getattr(param, "_fp4_megatron_drop_persistent_param_data", None)
+            return (
+                self.ddp_config.use_distributed_optimizer
+                and self.ddp_config.reuse_grad_buf_for_nvfp4_param_ag
+                and self.param_dtype != torch.uint8
+                and drop_hook is not None
+                and drop_hook()
             )
 
         # Check if this buffer contains NVFP4 params.
@@ -951,6 +1411,15 @@ class _ParamAndGradBuffer:
 
             param_end_index = param_start_index + param_numel
             self.param_index_map[param] = (param_start_index, param_end_index, bucket_id)
+            if not _drop_persistent_param_data_for_param(param):
+                param_data_start_index = _pad_start_of_param_if_needed(param_data_start_index)
+                param_data_end_index = param_data_start_index + param_numel
+                self.param_data_index_map[param] = (
+                    param_data_start_index,
+                    param_data_end_index,
+                    bucket_id,
+                )
+                param_data_start_index = param_data_end_index
             bucket_params.add(param)
 
             # For NVFP4, the grad buffer is sized at full numel (not packed), so we
@@ -982,6 +1451,9 @@ class _ParamAndGradBuffer:
         # Next, create underlying storage for buffer (with numel elements that includes
         # padding as necessary).
         self.numel = bucket_end_index
+        self.param_data_numel = (
+            self.param_data_bucket_indices[-1][1] if len(self.param_data_bucket_indices) > 0 else 0
+        )
         self.numel_unpadded = sum(per_bucket_numel_unpadded)
 
         # For NVFP4, grad buffer needs full size (roughly 2x the packed param buffer).
@@ -995,11 +1467,14 @@ class _ParamAndGradBuffer:
         assert self.numel_unpadded <= self.numel
         if self.ddp_config.use_distributed_optimizer:
             assert self.numel % self.data_parallel_world_size == 0
+            assert self.param_data_numel % self.data_parallel_world_size == 0
         else:
             assert self.numel == self.numel_unpadded
 
         self.param_data = None
         self.grad_data = None
+        self.nvfp4_reuse_param_data = None
+        self.nvfp4_reuse_grad_data = None
         self.extra_main_grads = []
 
         if self.nccl_ub:
@@ -1049,7 +1524,7 @@ class _ParamAndGradBuffer:
                 # Only re-map param tensors if using distributed optimizer.
                 if self.ddp_config.use_distributed_optimizer:
                     self.param_data = torch.zeros(
-                        self.numel,
+                        self.param_data_numel,
                         dtype=self.param_dtype,
                         device=torch.cuda.current_device(),
                         requires_grad=False,
@@ -1062,10 +1537,24 @@ class _ParamAndGradBuffer:
                     device=torch.cuda.current_device(),
                     requires_grad=False,
                 )
+            if (
+                self.ddp_config.reuse_grad_buf_for_nvfp4_param_ag
+                and self.param_data is not None
+                and self.param_dtype != torch.uint8
+            ):
+                assert self.param_data is not None
+                self.nvfp4_reuse_grad_data = self.grad_data
+                nvfp4_reuse_param_view = self.nvfp4_reuse_grad_data.view(self.param_dtype)
+                assert nvfp4_reuse_param_view.numel() >= self.numel
+                self.nvfp4_reuse_param_data = nvfp4_reuse_param_view[: self.numel]
 
         self.grad_data_size = 0
         self.param_data_size = 0
         self.param_data_cpu = None
+        fp4_unmapped_param_data_count = 0
+        fp4_unmapped_param_data_numel = 0
+        fp4_dropped_persistent_param_data_count = 0
+        fp4_dropped_persistent_param_data_numel = 0
 
         # Finally, map param.data and param.main_grad fields to buffers.
         bucket_params = []
@@ -1084,26 +1573,58 @@ class _ParamAndGradBuffer:
                         # all-gather to communicate packed NVFP4 bytes directly.
                         from ..fp4_utils import modify_nvfp4_rowwise_storage
 
+                        param_data_start, _, _ = self.param_data_index_map[param]
                         packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
                         rowwise_bytes_view = self._get(
-                            packed_shape, param_start_index, buffer_type=BufferType.PARAM
+                            packed_shape, param_data_start, buffer_type=BufferType.PARAM
                         )
                         modify_nvfp4_rowwise_storage(param, rowwise_bytes_view)
                     elif is_float8tensor(param):
+                        param_data_start, _, _ = self.param_data_index_map[param]
                         new_param_data = self._get(
-                            param.data.shape, param_start_index, buffer_type=BufferType.PARAM
+                            param.data.shape, param_data_start, buffer_type=BufferType.PARAM
                         )
                         modify_underlying_storage(param, new_param_data)
                     else:
-                        new_param_data = self._get(
-                            param.data.shape, param_start_index, buffer_type=BufferType.PARAM
+                        unmap_param_data_hook = getattr(
+                            param, "_fp4_megatron_unmap_param_data_from_ddp_buffer", None
                         )
-                        old_param_data = param.data
-                        param.data = new_param_data
-                        assert old_param_data._base is None
-                        # Copy tensor values (from initialization or checkpoint).
-                        param.data.detach().copy_(old_param_data)
-                        del old_param_data
+                        drop_persistent_param_data = (
+                            param not in self.param_data_index_map
+                            and getattr(
+                                param, "_fp4_megatron_drop_persistent_param_data", None
+                            )
+                            is not None
+                        )
+                        if drop_persistent_param_data:
+                            param._fp4_megatron_param_data_unmapped_from_ddp_buffer = True
+                            param._fp4_megatron_persistent_param_data_dropped = True
+                            fp4_unmapped_param_data_count += 1
+                            fp4_unmapped_param_data_numel += param.data.numel()
+                            fp4_dropped_persistent_param_data_count += 1
+                            fp4_dropped_persistent_param_data_numel += param.data.numel()
+                        else:
+                            param_data_start, _, _ = self.param_data_index_map[param]
+                            new_param_data = self._get(
+                                param.data.shape,
+                                param_data_start,
+                                buffer_type=BufferType.PARAM,
+                            )
+                            if unmap_param_data_hook is not None and unmap_param_data_hook():
+                                # Keep the real Parameter storage independent from the persistent
+                                # BF16 param buffer. The BF16 buffer is still populated because it
+                                # remains the fallback AG source until we remove that dependency.
+                                new_param_data.detach().copy_(param.data)
+                                param._fp4_megatron_param_data_unmapped_from_ddp_buffer = True
+                                fp4_unmapped_param_data_count += 1
+                                fp4_unmapped_param_data_numel += param.data.numel()
+                            else:
+                                old_param_data = param.data
+                                param.data = new_param_data
+                                assert old_param_data._base is None
+                                # Copy tensor values (from initialization or checkpoint).
+                                param.data.detach().copy_(old_param_data)
+                                del old_param_data
 
             # For NVFP4, use grad_index_map for main_grad (full numel offsets)
             if self.has_nvfp4_params:
@@ -1207,6 +1728,23 @@ class _ParamAndGradBuffer:
             tp_group=self.tp_group,
             dp_cp_group=self.dp_cp_group,
         )
+        max_nvfp4_trace_prints = int(os.getenv("NVFP4_REUSE_GRAD_BUF_TRACE_PRINTS", "0"))
+        if max_nvfp4_trace_prints > 0 and fp4_unmapped_param_data_count > 0:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+            else:
+                rank = 0
+            print(
+                f"[NVFP4_REUSE_GRAD_BUF_TRACE] rank={rank} "
+                f"event=unmap_param_data_from_ddp_buffer "
+                f"params={fp4_unmapped_param_data_count} "
+                f"numel={fp4_unmapped_param_data_numel} "
+                f"dropped_persistent_params={fp4_dropped_persistent_param_data_count} "
+                f"dropped_persistent_numel={fp4_dropped_persistent_param_data_numel} "
+                f"param_data_numel={self.param_data_numel} full_numel={self.numel}"
+                f"{_cuda_memory_trace_suffix()}",
+                flush=True,
+            )
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""
@@ -1237,7 +1775,9 @@ class _ParamAndGradBuffer:
         """
         end_index = start_index + shape.numel()
         if buffer_type == BufferType.PARAM:
-            assert end_index <= self.numel, "Requested tensor is out of param buffer range"
+            assert (
+                end_index <= self.param_data_numel
+            ), "Requested tensor is out of param buffer range"
             assert self.param_data is not None
             buffer_tensor = self.param_data[start_index:end_index]
         elif buffer_type == BufferType.GRAD:
@@ -1276,21 +1816,43 @@ class _ParamAndGradBuffer:
 
         # Get appropriate view into global _ParamAndGradBuffer.
         bucketed_param_data = None
+        param_data_start_index = 0
         if self.param_data is not None:
+            param_data_start_index, param_data_end_index = self.param_data_bucket_indices[
+                bucket_id
+            ]
             bucketed_param_data = self._get(
-                torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.PARAM
+                torch.Size([param_data_end_index - param_data_start_index]),
+                param_data_start_index,
+                buffer_type=BufferType.PARAM,
             )
+        bucketed_nvfp4_reuse_param_data = None
+        if self.nvfp4_reuse_param_data is not None:
+            bucketed_nvfp4_reuse_param_data = self.nvfp4_reuse_param_data[
+                start_index:end_index
+            ]
         # For NVFP4, use separate grad buffer offsets
+        bucketed_nvfp4_reuse_grad_data = None
         if grad_start_index is not None and grad_end_index is not None:
             bucketed_grad_data = self._get(
                 torch.Size([grad_end_index - grad_start_index]),
                 grad_start_index,
                 buffer_type=BufferType.GRAD,
             )
+            if self.nvfp4_reuse_grad_data is not None:
+                bucketed_nvfp4_reuse_grad_data = self.nvfp4_reuse_grad_data[
+                    grad_start_index:grad_end_index
+                ]
         else:
             bucketed_grad_data = self._get(
                 torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.GRAD
             )
+            if self.nvfp4_reuse_grad_data is not None:
+                bucketed_nvfp4_reuse_grad_data = self.nvfp4_reuse_grad_data[
+                    start_index:end_index
+                ]
+        if self.nvfp4_reuse_grad_data is self.grad_data:
+            bucketed_nvfp4_reuse_grad_data = bucketed_grad_data
         # For NVFP4, use grad buffer offset for bucket.offset since distrib_optimizer
         # uses it for grad buffer operations. For non-NVFP4, param and grad offsets are same.
         bucket_offset = grad_start_index if grad_start_index is not None else start_index
@@ -1304,6 +1866,10 @@ class _ParamAndGradBuffer:
             bucket_id=bucket_id,
             param_index_map=self.param_index_map,
             params_with_extra_main_grads=bucket_params_with_extra_main_grads,
+            nvfp4_reuse_param_data=bucketed_nvfp4_reuse_param_data,
+            nvfp4_reuse_grad_data=bucketed_nvfp4_reuse_grad_data,
+            param_data_index_map=self.param_data_index_map,
+            param_data_offset=param_data_start_index,
         )
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket

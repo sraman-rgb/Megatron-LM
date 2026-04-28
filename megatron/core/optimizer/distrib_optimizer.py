@@ -5,6 +5,7 @@
 import gc
 import itertools
 import logging
+import os
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -2641,17 +2642,30 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     assert world_range.size == shard_main_param.nelement()
 
                     gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
-                    model_param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data
-
-                    shard_model_param = model_param_buffer.view(-1)[
-                        world_range.start : world_range.end
-                    ]
+                    bucket = self.buffers[gbuf_index].buckets[bucket_id]
 
                     if self._is_distopt_quantized_param(model_param) or is_nvfp4tensor(model_param):
                         # Quantized params are handled above.
                         continue
+                    elif getattr(
+                        model_param, "_fp4_megatron_persistent_param_data_dropped", False
+                    ):
+                        param_range = param_range_map["param"]
+                        shard_model_param = model_param.view(-1)[
+                            param_range.start : param_range.end
+                        ]
                     else:
-                        shard_model_param.data.copy_(shard_main_param)
+                        model_param_buffer = bucket.param_data
+                        param_data_range = bucket.param_to_param_data_index[model_param]
+                        param_data_start, _ = param_data_range
+                        param_range = param_range_map["param"]
+                        param_data_shard_start = param_data_start + param_range.start
+                        param_data_shard_end = param_data_start + param_range.end
+                        shard_model_param = model_param_buffer.view(-1)[
+                            param_data_shard_start:param_data_shard_end
+                        ]
+
+                    shard_model_param.data.copy_(shard_main_param)
 
         # Copy shard groups to model groups.
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
@@ -2684,6 +2698,71 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 shard_param_buffer = param_buffer.view(-1)[world_range.start : world_range.end]
 
                 shard_param_buffer.copy_(shard_main_param)
+
+    def _copy_main_params_to_nvfp4_reuse_param_buffer(self):
+        """
+        Copy FP32 main params into the NVFP4 reuse BF16 param view.
+
+        This mirrors the MXFP8 shared-buffer timing for overlap-param-gather:
+        the shadow param view aliases the shadow grad buffer, so it must be
+        populated after grad zeroing and before the overlapped param all-gather.
+        """
+        if self.ddp_config.use_megatron_fsdp:
+            raise NotImplementedError(
+                "_copy_main_params_to_nvfp4_reuse_param_buffer not supported for Megatron-FSDP."
+            )
+        touched_buckets = set()
+        shadow_buckets = []
+        for buffer in self.buffers:
+            for bucket in buffer.buckets:
+                if bucket.nvfp4_reuse_param_data is not None:
+                    bucket.nvfp4_reuse_param_data.zero_()
+                    bucket.nvfp4_reuse_param_source_ready = False
+                    bucket.nvfp4_reuse_param_source = "shared_buffer"
+                    shadow_buckets.append(bucket)
+
+        def copy_group_params(shard_main_groups, model_groups):
+            for shard_main_group, model_group in zip(shard_main_groups, model_groups):
+                for shard_main_param, model_param in zip(shard_main_group, model_group):
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    world_range = param_range_map["gbuf_world_in_bucket"]
+
+                    assert world_range.size == shard_main_param.nelement()
+
+                    gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
+                    bucket = self.buffers[gbuf_index].buckets[bucket_id]
+                    if bucket.nvfp4_reuse_param_data is None:
+                        continue
+
+                    shard_param_buffer = bucket.nvfp4_reuse_param_data.view(-1)[
+                        world_range.start : world_range.end
+                    ]
+                    shard_param_buffer.copy_(shard_main_param)
+                    touched_buckets.add(bucket)
+
+        copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
+        copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
+
+        for bucket in shadow_buckets:
+            if bucket not in touched_buckets:
+                bucket.nvfp4_reuse_param_source = "shared_buffer_empty"
+                continue
+            bucket.nvfp4_reuse_param_source_ready = True
+            bucket.nvfp4_reuse_param_source = "shared_buffer"
+        max_prints = int(os.getenv("NVFP4_REUSE_GRAD_BUF_TRACE_PRINTS", "0"))
+        trace_prints = getattr(self, "_nvfp4_reuse_copy_trace_prints", 0)
+        if max_prints > 0 and trace_prints < max_prints:
+            setattr(self, "_nvfp4_reuse_copy_trace_prints", trace_prints + 1)
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+            else:
+                rank = 0
+            print(
+                f"[NVFP4_REUSE_GRAD_BUF_TRACE] rank={rank} "
+                f"event=copy_main_to_shared touched_buckets={len(touched_buckets)} "
+                f"reuse_buckets={len(shadow_buckets)}",
+                flush=True,
+            )
 
     def _build_model_param_to_state_dict_param_map(self, state_dict):
         """Create a map from model params to tensors in state_dict based on their names."""

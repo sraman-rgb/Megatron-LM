@@ -613,6 +613,11 @@ class TransformerConfig(ModelParallelConfig):
     """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
     Required when fp4_recipe is custom."""
 
+    fp4_megatron_weight_quantization: bool = False
+    """If set, TEFusedMLP explicitly quantizes BF16 weights before calling TE's BasicLinear
+    functional path. This is a correctness/debug path for matching TE's internal FP4
+    weight quantization without changing Transformer Engine."""
+
     high_priority_a2a_comm_stream: bool = False
     """If True, the communication stream created by set_streams for combined 1f1b
     a2a overlap is created with CUDA high priority."""
@@ -1300,6 +1305,15 @@ class TransformerConfig(ModelParallelConfig):
         # FP4 validation
         if self.fp4_param and not self.fp4:
             raise ValueError("fp4_param must be used together with fp4 mode.")
+
+        if self.fp4_megatron_weight_quantization and not self.fp4:
+            raise ValueError("fp4_megatron_weight_quantization must be used together with fp4 mode.")
+
+        if self.fp4_megatron_weight_quantization and self.fp4_param:
+            raise ValueError(
+                "fp4_megatron_weight_quantization expects BF16 model params and is incompatible "
+                "with fp4_param/fp4_param_gather."
+            )
 
         if self.fp4 and self.fp8:
             raise ValueError("fp4 and fp8 cannot be used simultaneously. Please choose one.")

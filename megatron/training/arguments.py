@@ -1069,6 +1069,20 @@ def validate_args(args, defaults={}):
     # FP4 param requires FP4 mode
     if args.fp4_param_gather and not args.fp4:
         raise ValueError("--fp4-param-gather must be used together with --fp4-format.")
+    if args.fp4_megatron_weight_quantization and not args.fp4:
+        raise ValueError("--fp4-megatron-weight-quantization must be used with --fp4-format.")
+    if args.fp4_megatron_weight_quantization and args.fp4_param_gather:
+        raise ValueError(
+            "--fp4-megatron-weight-quantization expects BF16 params and is incompatible "
+            "with --fp4-param-gather."
+        )
+    if args.reuse_grad_buf_for_nvfp4_param_ag and not args.fp4:
+        raise ValueError("--reuse-grad-buf-for-nvfp4-param-ag requires --fp4-format.")
+    if args.reuse_grad_buf_for_nvfp4_param_ag and args.fp4_param_gather:
+        raise ValueError(
+            "--reuse-grad-buf-for-nvfp4-param-ag validates BF16 param all-gather and "
+            "is incompatible with --fp4-param-gather."
+        )
 
     # FP4 requires TE >= 2.7.0.dev0
     if args.fp4 and not is_te_min_version("2.7.0.dev0"):
@@ -1098,6 +1112,7 @@ def validate_args(args, defaults={}):
         args.use_distributed_optimizer = True
         # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
         args.reuse_grad_buf_for_mxfp8_param_ag = False
+        args.reuse_grad_buf_for_nvfp4_param_ag = False
         # Optimizer compatibility check.
         assert args.optimizer in (
             'sgd',
@@ -2027,6 +2042,12 @@ def _add_transformer_engine_args(parser):
         action='store_true',
         help='Keep the compute param in fp4 (do not use any other intermediate '
         'dtype) and perform the param all-gather in fp4.',
+    )
+    group.add_argument(
+        '--fp4-megatron-weight-quantization',
+        action='store_true',
+        help='In TEFusedMLP, explicitly quantize BF16 weights before TE BasicLinear '
+        'functional forward instead of letting TE BasicLinear quantize internally.',
     )
     # FP8 related arguments
     group.add_argument(
@@ -3590,6 +3611,13 @@ def _add_mixed_precision_args(parser):
         '--reuse-grad-buf-for-mxfp8-param-ag',
         action='store_true',
         help='If True, reuse the grad buffer for MXFP8 parameter all-gather.',
+    )
+    group.add_argument(
+        '--reuse-grad-buf-for-nvfp4-param-ag',
+        action='store_true',
+        help='Debug-only: for NVFP4 compute with BF16 param all-gather, compare parameter '
+        'all-gather and gradient sync against a shadow grad-buffer reuse path without '
+        'enabling the reused buffer for training.',
     )
 
     return parser

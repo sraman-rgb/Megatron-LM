@@ -80,6 +80,11 @@ class DistributedDataParallelConfig:
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
        set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
 
+    reuse_grad_buf_for_nvfp4_param_ag: bool = False
+    """Reuse the grad buffer as the BF16 param AG output when NVFP4 compute is enabled
+       without FP4 param gather. This keeps BF16 AG numerics while allowing Megatron to
+       quantize the gathered BF16 weights into the NVFP4 forward shadow."""
+
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
 
@@ -212,6 +217,13 @@ class DistributedDataParallelConfig:
         """Check the validity of the config."""
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+        if self.reuse_grad_buf_for_nvfp4_param_ag:
+            assert (
+                not self.fp4_param_gather
+            ), "NVFP4 BF16 param AG reuse validation is incompatible with fp4_param_gather."
+            assert (
+                self.use_distributed_optimizer
+            ), "NVFP4 grad-buffer reuse validation requires the distributed optimizer."
 
         if self.nccl_ub:
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):

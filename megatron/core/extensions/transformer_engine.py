@@ -63,14 +63,18 @@ from megatron.core.utils import (
 
 try:
     import transformer_engine as te
+    from transformer_engine.pytorch.cpu_offload import is_cpu_offload_enabled, mark_activation_offload
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
+    from transformer_engine.pytorch.ops._common import is_quantized_tensor as is_te_quantized_tensor
 
     HAVE_TE = True
 except ImportError:
     if TYPE_CHECKING:
         # For type checking, treat transformer_engine as always available.
         import transformer_engine as te
+        from transformer_engine.pytorch.cpu_offload import is_cpu_offload_enabled, mark_activation_offload
         from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
+        from transformer_engine.pytorch.ops._common import is_quantized_tensor as is_te_quantized_tensor
 
         HAVE_TE = True
     else:
@@ -2238,6 +2242,823 @@ else:
 
 if HAVE_TE and is_te_min_version("1.13.0"):
 
+    class _MegatronQuantizedBasicLinear(te.pytorch.ops.BasicOperation):
+        """BasicLinear-compatible op that quantizes weights before TE functional forward.
+
+        This is a correctness/debug path for FP4: the registered parameter remains BF16, but the
+        weight quantizer is invoked explicitly here instead of inside TE BasicLinear.
+        """
+
+        def __init__(
+            self,
+            in_features: int,
+            out_features: int,
+            *,
+            device: Optional[torch.device | str] = None,
+            dtype: Optional[torch.dtype] = None,
+            tensor_parallel_mode: Optional[str] = None,
+            tensor_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+            sequence_parallel: bool = False,
+            rng_state_tracker_function: Optional[Callable[[], Any]] = None,
+            accumulate_into_main_grad: bool = False,
+            userbuffers_options: Optional[dict[str, Any]] = None,
+        ) -> None:
+            super().__init__()
+
+            self.in_features = in_features
+            self.out_features = out_features
+            dtype = torch.get_default_dtype() if dtype is None else dtype
+            if dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                raise ValueError(f"Supported dtypes are float32, float16, bfloat16 (got {dtype})")
+
+            (
+                self.tensor_parallel_mode,
+                self.tensor_parallel_group,
+                self.tensor_parallel_size,
+                self.sequence_parallel,
+                self.local_in_features,
+                self.local_out_features,
+            ) = te.pytorch.ops.BasicLinear._canonicalize_tensor_parallelism(
+                mode=tensor_parallel_mode,
+                process_group=tensor_parallel_group,
+                sequence_parallel=sequence_parallel,
+                in_features=in_features,
+                out_features=out_features,
+            )
+
+            weight = torch.empty(
+                self.local_out_features,
+                self.local_in_features,
+                device=device,
+                dtype=dtype,
+            )
+            self.weight: torch.nn.Parameter
+            self.register_parameter("weight", torch.nn.Parameter(weight))
+            self._rng_state_tracker_function = rng_state_tracker_function
+            self._accumulate_into_main_grad = accumulate_into_main_grad
+            self._userbuffers_options = userbuffers_options
+            self._fp4_debug_weight_cache = None
+            self._fp4_debug_weight_cache_compare_prints = 0
+            self._fp4_debug_weight_cache_missing_prints = 0
+            self._fp4_debug_weight_cache_skip_prints = 0
+            self._fp4_debug_weight_cache_trace_prints = 0
+            self._fp4_persistent_weight_shadow = None
+            self._fp4_persistent_weight_shadow_source = None
+            self._fp4_persistent_weight_shadow_compare_prints = 0
+            self._fp4_debug_pending_compare_message = None
+            self._fp4_debug_weight_cache_rowwise_usage = True
+            self._fp4_debug_weight_cache_columnwise_usage = True
+            self._fp4_debug_weight_cache_refresh_enabled = False
+            self._fp4_debug_weight_cache_source = None
+            self._fp4_debug_weight_compute_source = None
+            self._register_fp4_weight_cache_refresh_hook()
+
+        def _register_fp4_weight_cache_refresh_hook(self) -> None:
+            self.weight._fp4_megatron_refresh_weight_cache_from_all_gather = (
+                self._refresh_fp4_debug_weight_cache_from_all_gather
+            )
+            self.weight._fp4_megatron_skip_param_data_copy_after_all_gather = (
+                self._skip_param_data_copy_after_all_gather
+            )
+            self.weight._fp4_megatron_unmap_param_data_from_ddp_buffer = (
+                self._unmap_param_data_from_ddp_buffer
+            )
+            self.weight._fp4_megatron_drop_persistent_param_data = (
+                self._drop_persistent_param_data
+            )
+
+        def num_quantizers(self, mode: str) -> int:
+            if mode == "forward":
+                return 2
+            if mode == "backward":
+                return 1
+            return 0
+
+        def pre_fuser_forward(self, *, requires_grad: bool) -> None:
+            super().pre_fuser_forward(requires_grad=requires_grad)
+            if not FP8GlobalStateManager.is_fp8_enabled():
+                return
+
+            weight_requires_grad = requires_grad and self.weight.requires_grad
+            columnwise_usage = weight_requires_grad
+            if FP8GlobalStateManager.get_fp8_recipe().backward_override is not None:
+                columnwise_usage = False
+            # The persistent weight cache must be a superset of all forward usages.
+            # Validation forwards are rowwise-only, but training immediately needs
+            # columnwise metadata for backward.
+            self._fp4_debug_weight_cache_rowwise_usage = True
+            self._fp4_debug_weight_cache_columnwise_usage = True
+
+            input_quantizer = self.get_quantizer("forward", 0)
+            weight_quantizer = self.get_quantizer("forward", 1)
+            grad_output_quantizer = self.get_quantizer("backward", 0)
+            input_quantizer.set_usage(rowwise=True, columnwise=columnwise_usage)
+            weight_quantizer.set_usage(rowwise=True, columnwise=False)
+            grad_output_quantizer.set_usage(rowwise=True, columnwise=columnwise_usage)
+
+        def reset_recipe_state(self, *, recipe: Optional[Any]) -> None:
+            super().reset_recipe_state(recipe=recipe)
+
+            input_quantizer = self.get_quantizer("forward", 0)
+            weight_quantizer = self.get_quantizer("forward", 1)
+            grad_output_quantizer = self.get_quantizer("backward", 0)
+
+            if input_quantizer is not None:
+                input_quantizer.internal = True
+                if not (self.tensor_parallel_mode == "column" and self.sequence_parallel):
+                    input_quantizer.optimize_for_gemm = True
+            if grad_output_quantizer is not None:
+                grad_output_quantizer.internal = True
+                if not (self.tensor_parallel_mode == "row" and self.sequence_parallel):
+                    grad_output_quantizer.optimize_for_gemm = True
+            if weight_quantizer is not None:
+                weight_quantizer.internal = True
+
+            self._fp4_debug_weight_cache_refresh_enabled = (
+                recipe is not None and recipe.nvfp4()
+            )
+
+            if recipe is not None and recipe.nvfp4() and self.sequence_parallel:
+                if self.tensor_parallel_mode == "column":
+                    input_quantizer.with_amax_reduction = True
+                    input_quantizer.amax_reduction_group = self.tensor_parallel_group
+                elif self.tensor_parallel_mode == "row":
+                    grad_output_quantizer.with_amax_reduction = True
+                    grad_output_quantizer.amax_reduction_group = self.tensor_parallel_group
+
+        def _get_or_update_fp4_debug_weight_cache(
+            self,
+            weight: torch.Tensor,
+            weight_quantizer: Any,
+            *,
+            rowwise_usage: bool,
+            columnwise_usage: bool,
+        ) -> Optional[torch.Tensor]:
+            if (
+                weight_quantizer is None
+                or not hasattr(weight_quantizer, "make_empty")
+                or not hasattr(weight_quantizer, "update_quantized")
+            ):
+                return None
+
+            cache = self._fp4_debug_weight_cache
+            cache_matches = (
+                cache is not None
+                and is_te_quantized_tensor(cache)
+                and tuple(cache.size()) == tuple(weight.size())
+                and cache.dtype == weight.dtype
+                and cache.device == weight.device
+            )
+            if cache_matches and hasattr(cache, "get_usages"):
+                usages = cache.get_usages()
+                cache_matches = (
+                    usages.get("rowwise") == rowwise_usage
+                    and usages.get("columnwise") == columnwise_usage
+                )
+
+            if not cache_matches:
+                cache = weight_quantizer.make_empty(
+                    weight.size(),
+                    dtype=weight.dtype,
+                    device=weight.device,
+                    requires_grad=False,
+                )
+                self._fp4_debug_weight_cache = cache
+
+            with torch.no_grad():
+                weight_quantizer.update_quantized(weight.detach(), cache)
+
+            return cache
+
+        @staticmethod
+        def _use_persistent_weight_shadow() -> bool:
+            return os.getenv("FP4_MEGATRON_WEIGHT_SHADOW", "0").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+
+        @staticmethod
+        def _use_persistent_weight_shadow_in_forward() -> bool:
+            return os.getenv("FP4_MEGATRON_WEIGHT_SHADOW_USE_IN_FORWARD", "0").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+
+        @staticmethod
+        def _keep_weight_cache_with_persistent_shadow() -> bool:
+            return os.getenv("FP4_MEGATRON_WEIGHT_SHADOW_KEEP_CACHE_FOR_COMPARE", "0").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+
+        def _shadow_is_primary_forward_weight(self) -> bool:
+            return self._use_persistent_weight_shadow() and self._use_persistent_weight_shadow_in_forward()
+
+        def _should_refresh_fp4_debug_weight_cache(self) -> bool:
+            return (
+                not self._shadow_is_primary_forward_weight()
+                or self._keep_weight_cache_with_persistent_shadow()
+            )
+
+        @staticmethod
+        def _skip_param_data_copy_after_all_gather_enabled() -> bool:
+            return os.getenv(
+                "FP4_MEGATRON_WEIGHT_SHADOW_SKIP_PARAM_DATA_COPY", "0"
+            ).lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+
+        def _skip_param_data_copy_after_all_gather(self) -> bool:
+            return (
+                self._skip_param_data_copy_after_all_gather_enabled()
+                and self._shadow_is_primary_forward_weight()
+                and self._persistent_weight_shadow_is_usable_for_forward(
+                    self.weight,
+                    rowwise_usage=True,
+                    columnwise_usage=True,
+                )
+            )
+
+        @staticmethod
+        def _unmap_param_data_from_ddp_buffer_enabled() -> bool:
+            return os.getenv(
+                "FP4_MEGATRON_WEIGHT_SHADOW_UNMAP_PARAM_DATA", "0"
+            ).lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+
+        @staticmethod
+        def _drop_persistent_param_data_enabled() -> bool:
+            return os.getenv(
+                "FP4_MEGATRON_WEIGHT_SHADOW_DROP_PERSISTENT_PARAM_DATA", "0"
+            ).lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+
+        def _unmap_param_data_from_ddp_buffer(self) -> bool:
+            return (
+                (
+                    self._unmap_param_data_from_ddp_buffer_enabled()
+                    or self._drop_persistent_param_data_enabled()
+                )
+                and self._shadow_is_primary_forward_weight()
+            )
+
+        def _drop_persistent_param_data(self) -> bool:
+            return (
+                self._drop_persistent_param_data_enabled()
+                and self._shadow_is_primary_forward_weight()
+            )
+
+        def _get_or_update_fp4_persistent_weight_shadow(
+            self,
+            weight: torch.Tensor,
+            weight_quantizer: Any,
+            *,
+            rowwise_usage: bool,
+            columnwise_usage: bool,
+        ) -> Optional[torch.Tensor]:
+            if (
+                not self._use_persistent_weight_shadow()
+                or weight_quantizer is None
+                or not hasattr(weight_quantizer, "make_empty")
+                or not hasattr(weight_quantizer, "update_quantized")
+            ):
+                return None
+
+            shadow = self._fp4_persistent_weight_shadow
+            shadow_matches = (
+                shadow is not None
+                and is_te_quantized_tensor(shadow)
+                and tuple(shadow.size()) == tuple(weight.size())
+                and shadow.dtype == weight.dtype
+                and shadow.device == weight.device
+            )
+            if shadow_matches and hasattr(shadow, "get_usages"):
+                usages = shadow.get_usages()
+                shadow_matches = (
+                    usages.get("rowwise") == rowwise_usage
+                    and usages.get("columnwise") == columnwise_usage
+                )
+
+            if not shadow_matches:
+                shadow = weight_quantizer.make_empty(
+                    weight.size(),
+                    dtype=weight.dtype,
+                    device=weight.device,
+                    requires_grad=False,
+                )
+                self._fp4_persistent_weight_shadow = shadow
+
+            with torch.no_grad():
+                weight_quantizer.update_quantized(weight.detach(), shadow)
+
+            return shadow
+
+        def _refresh_fp4_debug_weight_cache_from_all_gather(
+            self, gathered_weight: torch.Tensor
+        ) -> None:
+            if not self._fp4_debug_weight_cache_refresh_enabled:
+                return
+            weight_quantizer = self.get_quantizer("forward", 1)
+            if weight_quantizer is None:
+                return
+            if not (
+                hasattr(weight_quantizer, "make_empty")
+                and hasattr(weight_quantizer, "update_quantized")
+            ):
+                return
+
+            rowwise_usage = self._fp4_debug_weight_cache_rowwise_usage
+            columnwise_usage = self._fp4_debug_weight_cache_columnwise_usage
+            weight_quantizer.set_usage(rowwise=rowwise_usage, columnwise=columnwise_usage)
+            ag_source = getattr(
+                self.weight, "_fp4_megatron_weight_cache_ag_source", None
+            )
+            all_gather_source = (
+                f"all_gather:{ag_source}" if ag_source is not None else "all_gather"
+            )
+
+            cache_refreshed = False
+            if self._should_refresh_fp4_debug_weight_cache():
+                self._get_or_update_fp4_debug_weight_cache(
+                    gathered_weight,
+                    weight_quantizer,
+                    rowwise_usage=rowwise_usage,
+                    columnwise_usage=columnwise_usage,
+                )
+                self._fp4_debug_weight_cache_source = all_gather_source
+                cache_refreshed = True
+            else:
+                self._fp4_debug_weight_cache = None
+                self._fp4_debug_weight_cache_source = "disabled:persistent_shadow"
+
+            shadow = self._get_or_update_fp4_persistent_weight_shadow(
+                gathered_weight,
+                weight_quantizer,
+                rowwise_usage=rowwise_usage,
+                columnwise_usage=columnwise_usage,
+            )
+            if shadow is not None:
+                self._fp4_persistent_weight_shadow_source = all_gather_source
+                if cache_refreshed:
+                    self._maybe_print_fp4_persistent_weight_shadow_compare()
+
+        @staticmethod
+        def _debug_rank() -> int:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                return torch.distributed.get_rank()
+            return 0
+
+        @staticmethod
+        def _is_current_stream_capturing() -> bool:
+            try:
+                return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            except RuntimeError:
+                return True
+
+        @staticmethod
+        def _use_weight_cache_in_forward() -> bool:
+            return os.getenv("FP4_MEGATRON_WEIGHT_CACHE_USE_IN_FORWARD", "0").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+
+        def _weight_cache_is_usable_for_forward(
+            self,
+            weight: torch.Tensor,
+            *,
+            rowwise_usage: bool,
+            columnwise_usage: bool,
+        ) -> bool:
+            cache = self._fp4_debug_weight_cache
+            if (
+                cache is None
+                or not is_te_quantized_tensor(cache)
+                or tuple(cache.size()) != tuple(weight.size())
+                or cache.dtype != weight.dtype
+                or cache.device != weight.device
+            ):
+                return False
+            if hasattr(cache, "get_usages"):
+                usages = cache.get_usages()
+                if rowwise_usage and not usages.get("rowwise"):
+                    return False
+                if columnwise_usage and not usages.get("columnwise"):
+                    return False
+            return True
+
+        def _persistent_weight_shadow_is_usable_for_forward(
+            self,
+            weight: torch.Tensor,
+            *,
+            rowwise_usage: bool,
+            columnwise_usage: bool,
+        ) -> bool:
+            shadow = self._fp4_persistent_weight_shadow
+            if (
+                shadow is None
+                or not is_te_quantized_tensor(shadow)
+                or tuple(shadow.size()) != tuple(weight.size())
+                or shadow.dtype != weight.dtype
+                or shadow.device != weight.device
+            ):
+                return False
+            if hasattr(shadow, "get_usages"):
+                usages = shadow.get_usages()
+                if rowwise_usage and not usages.get("rowwise"):
+                    return False
+                if columnwise_usage and not usages.get("columnwise"):
+                    return False
+            return True
+
+        @staticmethod
+        def _metadata_tensors_match(lhs: Optional[torch.Tensor], rhs: Optional[torch.Tensor]):
+            if lhs is None or rhs is None:
+                if lhs is None and rhs is None:
+                    return True, "none"
+                if lhs is None:
+                    return False, "forward-none/cache-present"
+                return False, "forward-present/cache-none"
+            if lhs.shape != rhs.shape or lhs.dtype != rhs.dtype or lhs.device != rhs.device:
+                return False, f"shape/dtype/device {lhs.shape}/{lhs.dtype}/{lhs.device} vs {rhs.shape}/{rhs.dtype}/{rhs.device}"
+            equal = torch.equal(lhs, rhs)
+            if equal:
+                return True, f"{tuple(lhs.shape)} {lhs.dtype}"
+            mismatch_count = torch.count_nonzero(lhs != rhs).item()
+            if lhs.is_floating_point():
+                max_abs = (lhs - rhs).abs().max().item()
+            else:
+                max_abs = (lhs.to(torch.int16) - rhs.to(torch.int16)).abs().max().item()
+            return False, f"{tuple(lhs.shape)} {lhs.dtype} mismatches={mismatch_count} max_abs={max_abs}"
+
+        def _make_fp4_debug_weight_cache_compare_message(
+            self,
+            forward_weight: Optional[torch.Tensor],
+            cached_weight: Optional[torch.Tensor],
+        ) -> Optional[str]:
+            if self._is_current_stream_capturing():
+                return self._make_fp4_debug_weight_cache_skip_message("stream_capturing")
+
+            if forward_weight is None or cached_weight is None:
+                max_missing_prints = int(
+                    os.getenv("FP4_MEGATRON_WEIGHT_CACHE_MISSING_PRINTS", "0")
+                )
+                if (
+                    max_missing_prints <= 0
+                    or self._fp4_debug_weight_cache_missing_prints >= max_missing_prints
+                ):
+                    return self._make_fp4_debug_weight_cache_skip_message(
+                        "missing_forward_or_cache"
+                    )
+                self._fp4_debug_weight_cache_missing_prints += 1
+                return (
+                    f"[FP4_WEIGHT_CACHE_COMPARE] rank={self._debug_rank()} "
+                    f"op={id(self)} shape={tuple(self.weight.shape)} "
+                    f"cache_source={self._fp4_debug_weight_cache_source} "
+                    f"weight_source={self._fp4_debug_weight_compute_source} "
+                    f"forward_weight={'set' if forward_weight is not None else 'none'} "
+                    f"cache={'set' if cached_weight is not None else 'none'}"
+                )
+
+            max_prints = int(os.getenv("FP4_MEGATRON_WEIGHT_CACHE_COMPARE_PRINTS", "0"))
+            if max_prints <= 0 or self._fp4_debug_weight_cache_compare_prints >= max_prints:
+                return self._make_fp4_debug_weight_cache_skip_message("compare_budget_exhausted")
+            self._fp4_debug_weight_cache_compare_prints += 1
+            print_budget = f"{self._fp4_debug_weight_cache_compare_prints}/{max_prints}"
+
+            if not (
+                is_te_quantized_tensor(forward_weight)
+                and is_te_quantized_tensor(cached_weight)
+                and hasattr(forward_weight, "get_metadata")
+                and hasattr(cached_weight, "get_metadata")
+            ):
+                return (
+                    f"[FP4_WEIGHT_CACHE_COMPARE] rank={self._debug_rank()} "
+                    f"op={id(self)} shape={tuple(self.weight.shape)} "
+                    f"cache_source={self._fp4_debug_weight_cache_source} "
+                    f"weight_source={self._fp4_debug_weight_compute_source} "
+                    f"print_budget={print_budget} "
+                    f"forward_quantized={is_te_quantized_tensor(forward_weight)} "
+                    f"cache_quantized={is_te_quantized_tensor(cached_weight)}"
+                )
+
+            forward_metadata = forward_weight.get_metadata()
+            cache_metadata = cached_weight.get_metadata()
+            keys = (
+                "rowwise_data",
+                "rowwise_scale_inv",
+                "columnwise_data",
+                "columnwise_scale_inv",
+                "amax_rowwise",
+                "amax_columnwise",
+            )
+            required_keys = {
+                key for key in keys if forward_metadata.get(key) is not None
+            }
+            parts = []
+            required_match = True
+            exact_metadata_match = True
+            for key in keys:
+                match, detail = self._metadata_tensors_match(
+                    forward_metadata.get(key), cache_metadata.get(key)
+                )
+                exact_metadata_match = exact_metadata_match and match
+                if key in required_keys:
+                    required_match = required_match and match
+                    parts.append(f"{key}={match}({detail})")
+                elif match:
+                    parts.append(f"{key}=True({detail})")
+                else:
+                    parts.append(f"{key}=extra({detail})")
+
+            return (
+                f"[FP4_WEIGHT_CACHE_COMPARE] rank={self._debug_rank()} op={id(self)} "
+                f"shape={tuple(self.weight.shape)} "
+                f"cache_source={self._fp4_debug_weight_cache_source} "
+                f"weight_source={self._fp4_debug_weight_compute_source} "
+                f"print_budget={print_budget} "
+                f"required_match={required_match} exact_metadata_match={exact_metadata_match} "
+                + " ".join(parts)
+            )
+
+        def _maybe_print_fp4_persistent_weight_shadow_compare(self) -> None:
+            if self._is_current_stream_capturing():
+                return
+            max_prints = int(os.getenv("FP4_MEGATRON_WEIGHT_SHADOW_COMPARE_PRINTS", "0"))
+            if (
+                max_prints <= 0
+                or self._fp4_persistent_weight_shadow_compare_prints >= max_prints
+            ):
+                return
+            self._fp4_persistent_weight_shadow_compare_prints += 1
+            print_budget = (
+                f"{self._fp4_persistent_weight_shadow_compare_prints}/{max_prints}"
+            )
+
+            cache = self._fp4_debug_weight_cache
+            shadow = self._fp4_persistent_weight_shadow
+            if not (
+                is_te_quantized_tensor(cache)
+                and is_te_quantized_tensor(shadow)
+                and hasattr(cache, "get_metadata")
+                and hasattr(shadow, "get_metadata")
+            ):
+                match = False
+                detail = (
+                    f"cache_quantized={is_te_quantized_tensor(cache)} "
+                    f"shadow_quantized={is_te_quantized_tensor(shadow)}"
+                )
+            else:
+                cache_metadata = cache.get_metadata()
+                shadow_metadata = shadow.get_metadata()
+                keys = (
+                    "rowwise_data",
+                    "rowwise_scale_inv",
+                    "columnwise_data",
+                    "columnwise_scale_inv",
+                    "amax_rowwise",
+                    "amax_columnwise",
+                )
+                required_keys = {
+                    key for key in keys if cache_metadata.get(key) is not None
+                }
+                parts = []
+                match = True
+                exact_metadata_match = True
+                for key in keys:
+                    key_match, key_detail = self._metadata_tensors_match(
+                        cache_metadata.get(key), shadow_metadata.get(key)
+                    )
+                    exact_metadata_match = exact_metadata_match and key_match
+                    if key in required_keys:
+                        match = match and key_match
+                        parts.append(f"{key}={key_match}({key_detail})")
+                    elif key_match:
+                        parts.append(f"{key}=True({key_detail})")
+                    else:
+                        parts.append(f"{key}=extra({key_detail})")
+                detail = (
+                    f"required_match={match} "
+                    f"exact_metadata_match={exact_metadata_match} "
+                    + " ".join(parts)
+                )
+
+            print(
+                f"[FP4_WEIGHT_SHADOW_COMPARE] rank={self._debug_rank()} "
+                f"op={id(self)} shape={tuple(self.weight.shape)} "
+                f"cache_source={self._fp4_debug_weight_cache_source} "
+                f"shadow_source={self._fp4_persistent_weight_shadow_source} "
+                f"print_budget={print_budget} match={match} {detail}",
+                flush=True,
+            )
+            strict = os.getenv(
+                "FP4_MEGATRON_WEIGHT_SHADOW_COMPARE_STRICT", "1"
+            ).lower() in ("1", "true", "yes", "on")
+            if strict and not match:
+                raise RuntimeError(
+                    "FP4 persistent weight shadow does not match the weight cache: "
+                    f"shape={tuple(self.weight.shape)} {detail}"
+                )
+
+        def _make_fp4_debug_weight_cache_skip_message(self, reason: str) -> Optional[str]:
+            max_skip_prints = int(os.getenv("FP4_MEGATRON_WEIGHT_CACHE_SKIP_PRINTS", "0"))
+            if max_skip_prints <= 0 or self._fp4_debug_weight_cache_skip_prints >= max_skip_prints:
+                return None
+            self._fp4_debug_weight_cache_skip_prints += 1
+            max_prints = os.getenv("FP4_MEGATRON_WEIGHT_CACHE_COMPARE_PRINTS", "0")
+            return (
+                f"[FP4_WEIGHT_CACHE_SKIP] rank={self._debug_rank()} op={id(self)} "
+                f"shape={tuple(self.weight.shape)} reason={reason} "
+                f"cache_source={self._fp4_debug_weight_cache_source} "
+                f"weight_source={self._fp4_debug_weight_compute_source} "
+                f"cache={'set' if self._fp4_debug_weight_cache is not None else 'none'} "
+                f"compare_prints={self._fp4_debug_weight_cache_compare_prints}/{max_prints} "
+                f"grad_enabled={torch.is_grad_enabled()} training={self.training}"
+            )
+
+        def _maybe_print_fp4_debug_weight_cache_trace(self) -> None:
+            max_prints = int(os.getenv("FP4_MEGATRON_WEIGHT_CACHE_TRACE_PRINTS", "0"))
+            if (
+                max_prints <= 0
+                or self._fp4_debug_weight_cache_trace_prints >= max_prints
+            ):
+                return
+            self._fp4_debug_weight_cache_trace_prints += 1
+            print(
+                f"[FP4_WEIGHT_CACHE_TRACE] rank={self._debug_rank()} "
+                f"op={id(self)} shape={tuple(self.weight.shape)} "
+                f"weight_source={self._fp4_debug_weight_compute_source} "
+                f"cache_source={self._fp4_debug_weight_cache_source} "
+                f"shadow_source={self._fp4_persistent_weight_shadow_source} "
+                f"cache={'set' if self._fp4_debug_weight_cache is not None else 'none'} "
+                f"shadow={'set' if self._fp4_persistent_weight_shadow is not None else 'none'} "
+                f"trace_prints={self._fp4_debug_weight_cache_trace_prints}/{max_prints} "
+                f"grad_enabled={torch.is_grad_enabled()} training={self.training}",
+                flush=True,
+            )
+
+        def _print_fp4_debug_pending_weight_cache_compare(self) -> None:
+            try:
+                if self._fp4_debug_pending_compare_message is not None:
+                    print(self._fp4_debug_pending_compare_message, flush=True)
+            finally:
+                self._fp4_debug_pending_compare_message = None
+
+        def op_forward(
+            self,
+            ctx,
+            input_: torch.Tensor,
+            prev_op_grad_output_quantizer: Optional[Any],
+            next_op_input_quantizer: Optional[Any],
+        ) -> torch.Tensor:
+            input_requires_grad = ctx.requires_grad
+            weight_requires_grad = ctx.requires_grad and self.weight.requires_grad
+
+            input_quantizer = self.get_quantizer("forward", 0)
+            weight_quantizer = self.get_quantizer("forward", 1)
+            output_quantizer = next_op_input_quantizer
+            grad_output_quantizer = self.get_quantizer("backward", 0)
+            grad_input_quantizer = prev_op_grad_output_quantizer
+
+            with_quantized_compute = FP8GlobalStateManager.is_fp8_enabled()
+            if with_quantized_compute:
+                backward_override = FP8GlobalStateManager.get_fp8_recipe().backward_override
+            else:
+                backward_override = None
+
+            if torch.is_autocast_enabled():
+                dtype = torch.get_autocast_dtype("cuda")
+            else:
+                dtype = self.weight.dtype
+
+            compute_weight = self.weight
+            using_prequantized_weight = False
+            weight_columnwise_usage = False
+            self._fp4_debug_weight_compute_source = "bf16"
+            self._fp4_debug_pending_compare_message = None
+            if not with_quantized_compute:
+                self._fp4_debug_pending_compare_message = (
+                    self._make_fp4_debug_weight_cache_skip_message(
+                        "quantized_compute_disabled"
+                    )
+                )
+            elif is_te_quantized_tensor(compute_weight):
+                self._fp4_debug_pending_compare_message = (
+                    self._make_fp4_debug_weight_cache_skip_message("weight_already_quantized")
+                )
+            else:
+                if weight_quantizer is None:
+                    raise ValueError("Missing quantizer for weight tensor")
+                weight_columnwise_usage = input_requires_grad and backward_override is None
+                self._fp4_debug_weight_cache_rowwise_usage = True
+                self._fp4_debug_weight_cache_columnwise_usage = True
+                weight_quantizer.set_usage(
+                    rowwise=True,
+                    columnwise=weight_columnwise_usage,
+                )
+                if (
+                    self._use_persistent_weight_shadow_in_forward()
+                    and self._persistent_weight_shadow_is_usable_for_forward(
+                        compute_weight,
+                        rowwise_usage=True,
+                        columnwise_usage=weight_columnwise_usage,
+                    )
+                ):
+                    compute_weight = self._fp4_persistent_weight_shadow
+                    using_prequantized_weight = True
+                    self._fp4_debug_weight_compute_source = "persistent_shadow"
+                elif (
+                    self._use_weight_cache_in_forward()
+                    and self._weight_cache_is_usable_for_forward(
+                        compute_weight,
+                        rowwise_usage=True,
+                        columnwise_usage=weight_columnwise_usage,
+                    )
+                ):
+                    compute_weight = self._fp4_debug_weight_cache
+                    using_prequantized_weight = True
+                    self._fp4_debug_weight_compute_source = "cache"
+                else:
+                    compute_weight = weight_quantizer(compute_weight)
+                    self._fp4_debug_weight_compute_source = "forward_quantizer"
+                if self._should_refresh_fp4_debug_weight_cache():
+                    self._fp4_debug_pending_compare_message = (
+                        self._make_fp4_debug_weight_cache_compare_message(
+                            compute_weight,
+                            self._fp4_debug_weight_cache,
+                        )
+                    )
+            self._maybe_print_fp4_debug_weight_cache_trace()
+
+            output, x_local, w = te.pytorch.ops.BasicLinear._functional_forward(
+                input=input_,
+                weight=compute_weight,
+                dtype=dtype,
+                tensor_parallel_mode=self.tensor_parallel_mode,
+                tensor_parallel_group=self.tensor_parallel_group,
+                sequence_parallel=self.sequence_parallel,
+                with_quantized_compute=with_quantized_compute,
+                backward_override=backward_override,
+                input_quantizer=input_quantizer,
+                weight_quantizer=weight_quantizer,
+                output_quantizer=output_quantizer,
+                input_requires_grad=input_requires_grad,
+                weight_requires_grad=weight_requires_grad,
+            )
+
+            if (
+                input_requires_grad
+                and compute_weight is not self.weight
+                and with_quantized_compute
+                and is_te_quantized_tensor(w)
+                and backward_override is None
+            ):
+                if not using_prequantized_weight:
+                    w.update_usage(rowwise_usage=False, columnwise_usage=True)
+
+            if ctx.requires_grad:
+                if backward_override == "high_precision":
+                    saved_input = input_ if weight_requires_grad else None
+                    saved_weight = self.weight if input_requires_grad else None
+                else:
+                    saved_input = x_local
+                    saved_weight = w
+                if is_cpu_offload_enabled():
+                    mark_activation_offload(saved_input)
+                ctx.save_for_backward(saved_input, saved_weight)
+                ctx.with_quantized_compute = with_quantized_compute and backward_override is None
+                ctx.backward_override = backward_override
+                ctx.input_quantizer = input_quantizer
+                ctx.weight_quantizer = weight_quantizer
+                ctx.grad_output_quantizer = grad_output_quantizer
+                ctx.grad_input_quantizer = grad_input_quantizer
+                ctx.dtype = dtype
+                ctx.input_requires_grad = input_requires_grad
+                ctx.weight_requires_grad = weight_requires_grad
+
+            return output
+
+        def op_backward(self, ctx, grad_output: torch.Tensor):
+            return te.pytorch.ops.BasicLinear.op_backward(self, ctx, grad_output)
+
     class TEFusedMLP(MLP):
         """MLP wrapper using Transformer Engine's operation-based API."""
 
@@ -2247,12 +3068,47 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             # Fused implementation
             self._fused_impl: Optional[Tuple[te.pytorch.ops.Sequential]] = None
+            self._register_fp4_weight_param_pre_ddp_hooks()
+
+        def _register_fp4_weight_param_pre_ddp_hooks(self) -> None:
+            if not self.config.fp4_megatron_weight_quantization:
+                return
+
+            def unmap_param_data_from_ddp_buffer() -> bool:
+                return (
+                    (
+                        _MegatronQuantizedBasicLinear._unmap_param_data_from_ddp_buffer_enabled()
+                        or _MegatronQuantizedBasicLinear._drop_persistent_param_data_enabled()
+                    )
+                    and _MegatronQuantizedBasicLinear._use_persistent_weight_shadow()
+                    and _MegatronQuantizedBasicLinear._use_persistent_weight_shadow_in_forward()
+                )
+
+            def drop_persistent_param_data() -> bool:
+                return (
+                    _MegatronQuantizedBasicLinear._drop_persistent_param_data_enabled()
+                    and _MegatronQuantizedBasicLinear._use_persistent_weight_shadow()
+                    and _MegatronQuantizedBasicLinear._use_persistent_weight_shadow_in_forward()
+                )
+
+            for weight in (self.linear_fc1.weight, self.linear_fc2.weight):
+                weight._fp4_megatron_unmap_param_data_from_ddp_buffer = (
+                    unmap_param_data_from_ddp_buffer
+                )
+                weight._fp4_megatron_drop_persistent_param_data = (
+                    drop_persistent_param_data
+                )
 
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module matching MLP."""
 
             # Container for fusible ops
             fused_impl = te.pytorch.ops.Sequential()
+            basic_linear_cls = (
+                _MegatronQuantizedBasicLinear
+                if self.config.fp4_megatron_weight_quantization
+                else te.pytorch.ops.BasicLinear
+            )
 
             # Tensor parallelism configuration
             tp_world_size = get_tensor_model_parallel_world_size()
@@ -2305,7 +3161,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             userbuffers_options = None
             if self.linear_fc1.config.tp_comm_overlap and self.linear_fc1.ub_name is not None:
                 userbuffers_options = {"comm_name": self.linear_fc1.ub_name}
-            op = te.pytorch.ops.BasicLinear(
+            op = basic_linear_cls(
                 weight.size(1),
                 weight.size(0) * tp_world_size,
                 device="meta",
@@ -2318,6 +3174,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 userbuffers_options=userbuffers_options,
             )
             op.weight = weight
+            if hasattr(op, "_register_fp4_weight_cache_refresh_hook"):
+                op._register_fp4_weight_cache_refresh_hook()
             fused_impl.append(op)
 
             # FC1 bias op
@@ -2342,7 +3200,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             userbuffers_options = None
             if self.linear_fc2.config.tp_comm_overlap and self.linear_fc2.ub_name is not None:
                 userbuffers_options = {"comm_name": self.linear_fc2.ub_name}
-            op = te.pytorch.ops.BasicLinear(
+            op = basic_linear_cls(
                 weight.size(1),
                 weight.size(0),
                 device="meta",
@@ -2352,6 +3210,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 userbuffers_options=userbuffers_options,
             )
             op.weight = weight
+            if hasattr(op, "_register_fp4_weight_cache_refresh_hook"):
+                op._register_fp4_weight_cache_refresh_hook()
             fused_impl.append(op)
             if tp_world_size > 1:
                 if self.linear_fc2.sequence_parallel:
@@ -2515,6 +3375,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             # Apply fused impl
             out = self._fused_impl[0](hidden_states)
+            if self.config.fp4_megatron_weight_quantization:
+                for op in self._fused_impl[0]:
+                    print_compare = getattr(
+                        op, "_print_fp4_debug_pending_weight_cache_compare", None
+                    )
+                    if print_compare is not None:
+                        print_compare()
 
             # Return bias tensor if requested
             bias = None
