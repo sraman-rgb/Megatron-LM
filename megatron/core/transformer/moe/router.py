@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from abc import ABC, abstractmethod
 from typing import Optional, Union
 
@@ -25,6 +26,20 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
 
 
 class Router(ABC, MegatronModule):
@@ -216,6 +231,7 @@ class TopKRouter(Router):
         self.router_replay = None
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
+        self._forced_ep_rank_balanced_routing_printed = False
 
     def _maintain_float32_expert_bias(self):
         """
@@ -585,6 +601,139 @@ class TopKRouter(Router):
                     routing_map = routing_map & (~padding_mask)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
+    def _apply_expert_bias_from_indices(
+        self, top_indices: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ):
+        """Update expert-bias counts from compact [num_tokens, topk] routing indices."""
+        if self.enable_expert_bias and torch.is_grad_enabled():
+            with torch.no_grad():
+                top_indices = top_indices.to(torch.long)
+                valid_indices = (top_indices >= 0) & (top_indices < self.config.num_moe_experts)
+                if padding_mask is not None:
+                    token_mask = (~padding_mask).reshape(-1, 1).expand_as(top_indices)
+                    valid_indices = valid_indices & token_mask
+
+                token_counts = torch.zeros_like(self.local_tokens_per_expert)
+                safe_indices = top_indices.clamp(min=0, max=self.config.num_moe_experts - 1)
+                token_counts.scatter_add_(
+                    0,
+                    safe_indices.reshape(-1),
+                    valid_indices.reshape(-1).to(token_counts.dtype),
+                )
+                self.local_tokens_per_expert += token_counts
+
+    def _use_compact_hybridep_routing(self) -> bool:
+        """Return compact topK routing only for the HybridEP path that can consume it."""
+        return (
+            self.routing_type != "sinkhorn"
+            and self.config.moe_token_dispatcher_type == "flex"
+            and self.config.moe_flex_dispatcher_backend == "hybridep"
+            and self.config.num_moe_experts <= 256
+            and self.config.moe_expert_capacity_factor is None
+            and not self.config.moe_pad_expert_input_to_capacity
+        )
+
+    def _forced_ep_rank_balanced_routing(
+        self,
+        logits: torch.Tensor,
+        compact_hybridep_routing: bool,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
+        """Force every token to route to the same number of experts on each EP rank."""
+        experts_per_ep_rank = _env_int("MOE_ROUTER_FORCE_EXPERTS_PER_EP_RANK", 0)
+        if experts_per_ep_rank <= 0:
+            return None
+
+        if self.routing_type == "sinkhorn":
+            raise ValueError("MOE_ROUTER_FORCE_EXPERTS_PER_EP_RANK does not support sinkhorn.")
+        if self.config.moe_expert_capacity_factor is not None:
+            raise ValueError(
+                "MOE_ROUTER_FORCE_EXPERTS_PER_EP_RANK does not support expert capacity routing."
+            )
+
+        ep_size = _env_int(
+            "MOE_ROUTER_FORCE_EP_SIZE",
+            int(getattr(self.config, "expert_model_parallel_size", 1)),
+        )
+        num_experts = int(self.config.num_moe_experts)
+        if ep_size <= 0 or num_experts % ep_size != 0:
+            raise ValueError(
+                "MOE_ROUTER_FORCE_EXPERTS_PER_EP_RANK requires num_moe_experts to be "
+                f"divisible by ep_size, got num_moe_experts={num_experts}, ep_size={ep_size}."
+            )
+
+        num_local_experts = num_experts // ep_size
+        forced_topk = experts_per_ep_rank * ep_size
+        if forced_topk != self.topk:
+            raise ValueError(
+                "MOE_ROUTER_FORCE_EXPERTS_PER_EP_RANK must multiply to router topK: "
+                f"{experts_per_ep_rank} * {ep_size} = {forced_topk}, topK={self.topk}."
+            )
+        if experts_per_ep_rank > num_local_experts:
+            raise ValueError(
+                "MOE_ROUTER_FORCE_EXPERTS_PER_EP_RANK exceeds local experts: "
+                f"{experts_per_ep_rank} > {num_local_experts}."
+            )
+
+        if (
+            not self._forced_ep_rank_balanced_routing_printed
+            and _env_flag_enabled("MOE_ROUTER_FORCE_EXPERTS_PER_EP_RANK_PRINT", True)
+        ):
+            selected = [
+                ep_rank * num_local_experts + local_expert
+                for ep_rank in range(ep_size)
+                for local_expert in range(experts_per_ep_rank)
+            ]
+            print(
+                "[TopKRouter] forcing fixed EP-balanced routing: "
+                f"experts_per_ep_rank={experts_per_ep_rank}, ep_size={ep_size}, "
+                f"num_local_experts={num_local_experts}, selected_global_experts={selected}",
+                flush=True,
+            )
+            self._forced_ep_rank_balanced_routing_printed = True
+
+        num_tokens = logits.shape[0]
+        local_ids = torch.arange(experts_per_ep_rank, device=logits.device, dtype=torch.long)
+        ep_ids = torch.arange(ep_size, device=logits.device, dtype=torch.long).unsqueeze(1)
+        top_indices_1d = (ep_ids * num_local_experts + local_ids).reshape(-1)
+        top_indices = top_indices_1d.unsqueeze(0).expand(num_tokens, -1)
+        if self.score_function == "softmax":
+            if self.config.moe_router_pre_softmax:
+                scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+                top_probs = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+            else:
+                scores = torch.gather(logits, dim=1, index=top_indices)
+                top_probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
+        elif self.score_function in ("sigmoid", "sqrtsoftplus"):
+            if self.score_function == "sigmoid":
+                scores = torch.sigmoid(logits.float())
+            else:
+                scores = torch.nn.functional.softplus(logits.float()).sqrt()
+            top_probs = torch.gather(scores, dim=1, index=top_indices)
+            top_probs = top_probs / (top_probs.sum(dim=-1, keepdim=True) + 1e-20)
+            top_probs = top_probs.type_as(logits)
+        else:
+            raise ValueError(f"Invalid score_function: {self.score_function}")
+
+        if self.config.moe_router_topk_scaling_factor:
+            top_probs = top_probs * self.config.moe_router_topk_scaling_factor
+
+        dense_probs = torch.zeros_like(logits).scatter(1, top_indices, top_probs)
+        dense_routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(
+            1, top_indices, True
+        )
+        if padding_mask is not None:
+            valid_mask = (~padding_mask).reshape(-1, 1)
+            aux_scores = dense_probs * valid_mask
+            aux_routing_map = dense_routing_map & valid_mask
+        else:
+            aux_scores = dense_probs
+            aux_routing_map = dense_routing_map
+
+        if compact_hybridep_routing:
+            return top_probs, top_indices.to(torch.uint8), aux_scores, aux_routing_map
+        return dense_probs, dense_routing_map, aux_scores, aux_routing_map
+
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Top-k routing function
 
@@ -610,7 +759,15 @@ class TopKRouter(Router):
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
         # Calculate probs and routing_map for token dispatching
-        if self.routing_type == "sinkhorn":
+        compact_hybridep_routing = self._use_compact_hybridep_routing()
+        forced_routing = self._forced_ep_rank_balanced_routing(
+            logits, compact_hybridep_routing, padding_mask=padding_mask
+        )
+        aux_scores_forced = None
+        aux_routing_map_forced = None
+        if forced_routing is not None:
+            probs, routing_map, aux_scores_forced, aux_routing_map_forced = forced_routing
+        elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         else:
             probs, routing_map = topk_routing_with_score_function(
@@ -624,10 +781,14 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
+                dense_output=compact_hybridep_routing,
             )
+            if compact_hybridep_routing:
+                routing_map = routing_map.to(torch.uint8)
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
+            assert not compact_hybridep_routing
             probs, routing_map = apply_router_token_dropping(
                 probs,
                 routing_map,
@@ -640,13 +801,19 @@ class TopKRouter(Router):
         # Apply each aux loss type and attach aux loss autograd function to probs
         if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
             # Calculate scores and routing_map for aux loss
-            routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
-                logits,
-                self.topk,
-                self.score_function,
-                fused=self.config.moe_router_fusion,
-                padding_mask=padding_mask,
-            )
+            if aux_routing_map_forced is not None:
+                routing_map_for_aux_loss = aux_routing_map_forced
+                scores_for_aux_loss = aux_scores_forced
+            else:
+                routing_map_for_aux_loss, scores_for_aux_loss = (
+                    compute_routing_scores_for_aux_loss(
+                        logits,
+                        self.topk,
+                        self.score_function,
+                        fused=self.config.moe_router_fusion,
+                        padding_mask=padding_mask,
+                    )
+                )
             probs = self._apply_aux_loss(
                 probs,
                 scores_for_aux_loss,
@@ -669,7 +836,10 @@ class TopKRouter(Router):
             )
 
         # Optionally apply expert bias
-        self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+        if compact_hybridep_routing:
+            self._apply_expert_bias_from_indices(routing_map, padding_mask=padding_mask)
+        else:
+            self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
         return probs, routing_map
 
