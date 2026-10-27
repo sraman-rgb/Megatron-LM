@@ -17,12 +17,14 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.grad_fanin import GradFanIn, attach_grad_fanin, grad_fanin_tap
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
+    router_input_grad_fanin,
 )
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
@@ -513,6 +515,34 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_event = torch.cuda.Event()
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
+    def _input_grad_fanin(self, hidden_states: torch.Tensor) -> Optional[GradFanIn]:
+        """Gradient fan-in of the MoE layer input (``config.moe_fuse_input_grad``).
+
+        ``shared_experts_compute``, ``route`` and ``preprocess`` receive the same layer input
+        (in an order that depends on the schedule); the first of them creates the fan-in and
+        the others find it again by tensor identity. The dispatch path joins through an
+        identity tap, the router gating GEMM and the shared-expert fc1 join directly so their
+        input-gradient GEMMs accumulate into the running sum.
+        """
+        if not (
+            self.config.moe_fuse_input_grad
+            and self.training
+            and torch.is_grad_enabled()
+            and hidden_states.requires_grad
+        ):
+            return None
+        if (
+            self.config.cuda_graph_impl == "transformer_engine"
+            and CudaGraphModule.moe_router in self.config.cuda_graph_modules
+        ):
+            # A partial MoE graph separates the consumers into captured and eager parts.
+            return None
+        fanin = getattr(self, "_input_grad_fanin_cur", None)
+        if fanin is None or not fanin.matches(hidden_states):
+            fanin = GradFanIn(hidden_states)
+            self._input_grad_fanin_cur = fanin
+        return fanin
+
     @maybe_skip_or_early_return_by_cudagraph("route")
     def route(
         self,
@@ -529,10 +559,15 @@ class MoELayer(BaseMoELayer):
         """
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
+        fanin = self._input_grad_fanin(hidden_states)
         hidden_states = self.token_dispatcher.wrap_layer_input(hidden_states)
-        probs, routing_map = apply_module(self.router)(
-            hidden_states, padding_mask, input_ids=input_ids, packed_seq_params=packed_seq_params
-        )
+        with router_input_grad_fanin(fanin):
+            probs, routing_map = apply_module(self.router)(
+                hidden_states,
+                padding_mask,
+                input_ids=input_ids,
+                packed_seq_params=packed_seq_params,
+            )
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -575,6 +610,10 @@ class MoELayer(BaseMoELayer):
                     "inference dispatcher. Either disable moe_shared_expert_overlap or set "
                     "inference_moe_token_dispatcher_type='nvls'."
                 )
+        fanin = self._input_grad_fanin(hidden_states)
+        if fanin is not None:
+            # The dispatch-path gradient usually arrives first in backward and seeds the sum.
+            hidden_states = grad_fanin_tap(hidden_states, fanin)
         # Project the hidden_states from hidden dimension down to latent dimension.
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
@@ -615,7 +654,9 @@ class MoELayer(BaseMoELayer):
                     apply_module(self.shared_experts), self.config, self.tp_group, hidden_states
                 )
             else:
-                shared_expert_output = apply_module(self.shared_experts)(hidden_states)
+                fanin = self._input_grad_fanin(hidden_states)
+                with attach_grad_fanin(getattr(self.shared_experts, "linear_fc1", None), fanin):
+                    shared_expert_output = apply_module(self.shared_experts)(hidden_states)
 
         return shared_expert_output
 
