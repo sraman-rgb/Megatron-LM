@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import partial
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -174,6 +174,7 @@ def _allreduce_word_embedding_grads(
     config: TransformerConfig,
     embd_group: Optional[torch.distributed.ProcessGroup] = None,
     pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    force_all_reduce: bool = False,
 ):
     """All-reduce word-embedding gradients across the first and last PP stages.
 
@@ -193,6 +194,9 @@ def _allreduce_word_embedding_grads(
         pp_group: The pipeline
             parallel process group used to identify first/last stages. If
             ``None``, it will be looked up.
+        force_all_reduce: Whether the DP grad sync used an all-reduce instead of a
+            reduce-scatter; then the full gradient is reduced (see
+            ``DistributedDataParallelConfig.shard_embedding_grad_allreduce``).
     """
     if embd_group is None:
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
@@ -206,6 +210,7 @@ def _allreduce_word_embedding_grads(
         pp_group,
         partial(_get_shared_word_embedding_weight, config=config),
         config=config,
+        force_all_reduce=force_all_reduce,
     )
 
 
@@ -245,6 +250,7 @@ def _allreduce_embedding_grad(
     weight_getter: Callable[[torch.nn.Module], Optional[torch.nn.Parameter]],
     skip_if_none: bool = True,
     config: TransformerConfig = None,
+    force_all_reduce: bool = False,
 ):
     """Unified helper to all-reduce embedding parameters across pipeline stages.
 
@@ -258,6 +264,8 @@ def _allreduce_embedding_grad(
             (or ``None`` if not applicable).
         skip_if_none (bool, optional): If True, quietly returns when the parameter or its
             gradient is ``None``. Defaults to True.
+        force_all_reduce (bool, optional): Whether the DP grad sync used an all-reduce
+            instead of a reduce-scatter. Defaults to False.
     """
 
     if (
@@ -277,6 +285,7 @@ def _allreduce_embedding_grad(
         else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
+        ddp_module = model_module
         ddp_config = model_module.ddp_config
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
 
@@ -295,11 +304,110 @@ def _allreduce_embedding_grad(
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
-        torch.distributed.all_reduce(grad, group=embd_group)
+        shard_range = None
+        if (
+            getattr(ddp_config, 'shard_embedding_grad_allreduce', False)
+            and not force_all_reduce
+            and not ddp_config.use_megatron_fsdp
+            and grad is orig_grad
+        ):
+            shard_range = _embedding_grad_shard_range(ddp_module, weight, grad, embd_group)
+        if shard_range is None:
+            torch.distributed.all_reduce(grad, group=embd_group)
+        elif shard_range[1] > shard_range[0]:
+            # Only the distributed-optimizer shards of the grad are read after this point, so
+            # reducing the union of the group's shard ranges is enough.
+            torch.distributed.all_reduce(
+                grad.view(-1)[shard_range[0] : shard_range[1]], group=embd_group
+            )
         if ddp_config.use_megatron_fsdp:
             _copy_embedding_grad_back(orig_grad, grad)
         else:
             setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
+
+
+# Attribute of an embedding parameter caching _embedding_grad_shard_range results:
+# {embedding-group ranks: (lo, hi) or None}.
+_EMBEDDING_GRAD_SHARD_RANGES_ATTR = "_embedding_grad_allreduce_shard_ranges"
+
+
+def _local_grad_shard_range(
+    ddp_module: torch.nn.Module, weight: torch.nn.Parameter
+) -> Optional[Tuple[int, int]]:
+    """Element range of ``weight``'s flattened grad inside this rank's distributed-optimizer
+    shard of its grad bucket, or None if the grad does not live in a reduce-scattered bucket."""
+    ddp_config = getattr(ddp_module, 'ddp_config', None)
+    bucket_group = getattr(ddp_module, 'param_to_bucket_group', {}).get(weight)
+    if (
+        ddp_config is None
+        or not ddp_config.use_distributed_optimizer
+        or bucket_group is None
+        or weight not in bucket_group.param_to_bucket
+    ):
+        return None
+    bucket = bucket_group.param_to_bucket[weight]
+    start, end = bucket.param_to_index[weight]
+    dp_size = bucket_group.intra_distributed_optimizer_instance_size
+    dp_rank = bucket_group.intra_distributed_optimizer_instance_rank
+    if bucket.grad_data.numel() % dp_size != 0:
+        return None
+    shard_size = bucket.grad_data.numel() // dp_size
+    lo = max(start, dp_rank * shard_size)
+    hi = min(end, (dp_rank + 1) * shard_size)
+    if hi <= lo:
+        return (0, 0)
+    return (lo - start, hi - start)
+
+
+def _embedding_grad_shard_range(
+    ddp_module: torch.nn.Module,
+    weight: torch.nn.Parameter,
+    grad: torch.Tensor,
+    embd_group: torch.distributed.ProcessGroup,
+) -> Optional[Tuple[int, int]]:
+    """Element range of the flattened embedding grad to all-reduce across ``embd_group``.
+
+    With the distributed optimizer, the DP reduce-scatter leaves each rank with a valid grad only
+    in its own shard of the grad buffer, and the optimizer reads nothing else. The embedding-group
+    peers (same DP rank, different PP stages) therefore only need their shards reduced. This
+    returns the union of the peers' shard ranges in the param's element space ((0, 0) if no peer's
+    shard overlaps the param), or None to reduce the whole grad.
+
+    The ranges depend only on the buffer layout. They are exchanged once with an all-gather over
+    ``embd_group`` (all peers call this together) and cached; a first call inside a CUDA graph
+    capture reduces the whole grad instead and does not cache.
+    """
+    group_ranks = tuple(torch.distributed.get_process_group_ranks(embd_group))
+    cached = getattr(weight, _EMBEDDING_GRAD_SHARD_RANGES_ATTR, None)
+    if cached is None:
+        cached = {}
+        setattr(weight, _EMBEDDING_GRAD_SHARD_RANGES_ATTR, cached)
+    if group_ranks in cached:
+        return cached[group_ranks]
+    if torch.cuda.is_current_stream_capturing():
+        return None
+
+    local = _local_grad_shard_range(ddp_module, weight) if grad.is_contiguous() else None
+    if local is not None and local[1] > local[0]:
+        assert grad.numel() >= local[1]
+    local_tensor = torch.tensor(
+        [local[0], local[1], 1] if local is not None else [0, 0, 0],
+        dtype=torch.int64,
+        device=grad.device,
+    )
+    gathered = [torch.empty_like(local_tensor) for _ in range(get_pg_size(embd_group))]
+    torch.distributed.all_gather(gathered, local_tensor, group=embd_group)
+    ranges = [tuple(t.tolist()) for t in gathered]
+
+    result = None
+    if all(valid == 1 for _, _, valid in ranges):
+        nonempty = [(lo, hi) for lo, hi, _ in ranges if hi > lo]
+        if nonempty:
+            result = (min(lo for lo, _ in nonempty), max(hi for _, hi in nonempty))
+        else:
+            result = (0, 0)
+    cached[group_ranks] = result
+    return result
 
 
 def _allreduce_position_embedding_grads(
@@ -307,6 +415,7 @@ def _allreduce_position_embedding_grads(
     config: TransformerConfig,
     pos_emb_group: torch.distributed.ProcessGroup,
     pp_group: torch.distributed.ProcessGroup,
+    force_all_reduce: bool = False,
 ):
     """
     All-reduce position_embeddings grad across encoder and decoder stages to ensure that position
@@ -314,7 +423,12 @@ def _allreduce_position_embedding_grads(
     """
 
     _allreduce_embedding_grad(
-        model, pos_emb_group, pp_group, _get_position_embedding_weight, skip_if_none=False
+        model,
+        pos_emb_group,
+        pp_group,
+        _get_position_embedding_weight,
+        skip_if_none=False,
+        force_all_reduce=force_all_reduce,
     )
 
 
@@ -768,8 +882,12 @@ def finalize_model_grads(
         config.timers('embedding-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
         )
-    _allreduce_word_embedding_grads(model, config, embd_group, pp_group)
-    _allreduce_position_embedding_grads(model, config, pos_emb_group, pp_group)
+    _allreduce_word_embedding_grads(
+        model, config, embd_group, pp_group, force_all_reduce=force_all_reduce
+    )
+    _allreduce_position_embedding_grads(
+        model, config, pos_emb_group, pp_group, force_all_reduce=force_all_reduce
+    )
 
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
