@@ -191,6 +191,9 @@ def _is_mxfp8_attention_active() -> bool:
     if int(os.getenv("NVTE_FP8_DPA_BWD", "1")) == 0:
         return False
     recipe = FP8GlobalStateManager.get_fp8_recipe()
+    if (recipe.nvfp4() or recipe.custom()) and recipe.fp8_dpa:
+        # FP4 linears with MXFP8 attention.
+        return os.getenv("NVTE_DPA_FP8_RECIPE", "") == "MXFP8BlockScaling"
     return recipe.mxfp8() and recipe.fp8_dpa
 
 

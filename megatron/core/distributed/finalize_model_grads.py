@@ -1,5 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
+import os
 from functools import partial
 from typing import Callable, Dict, List, Optional, Union
 
@@ -30,6 +32,9 @@ from ..utils import (
     get_tensor_model_parallel_group_if_none,
 )
 
+
+
+logger = logging.getLogger(__name__)
 
 def _get_main_grad_attr(param: torch.nn.Parameter):
     if hasattr(param, "main_grad"):
@@ -240,6 +245,7 @@ def _allreduce_embedding_grad(
         else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
+        ddp_module = model_module
         ddp_config = model_module.ddp_config
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
 
@@ -255,8 +261,103 @@ def _allreduce_embedding_grad(
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
-        torch.distributed.all_reduce(grad, group=embd_group)
+        if os.environ.get("MLPERF_EMB_GRAD_AR_SHARD", "0") == "1" and not _EMBEDDING_GRAD_SHARD_CACHE:
+            _emb_ar_log(f"MLPERF_EMB_GRAD_AR_SHARD: embedding grad {tuple(grad.shape)} {grad.dtype}")
+        shard = _embedding_grad_shard_range(ddp_module, ddp_config, weight, grad, embd_group)
+        if shard is not None:
+            # Only this rank's distributed-optimizer shard of the grad is read after the
+            # reduce-scatter, and the paired rank on the other stage reads the same DP shard,
+            # so reducing the union of the two shard ranges gives the optimizer the same values
+            # as reducing the whole tensor, for ~1/DP of the bytes.
+            lo, hi = shard
+            check = (
+                os.environ.get("MLPERF_EMB_GRAD_AR_SHARD_CHECK", "0") == "1"
+                and not torch.cuda.is_current_stream_capturing()
+            )
+            if check:
+                full = grad.detach().clone()
+                torch.distributed.all_reduce(full, group=embd_group)
+            if hi > lo:
+                torch.distributed.all_reduce(grad.view(-1)[lo:hi], group=embd_group)
+            if check:
+                diff = (full.view(-1)[lo:hi] - grad.view(-1)[lo:hi]).abs().max().item() if hi > lo else 0.0
+                _emb_ar_log(
+                    f"MLPERF_EMB_GRAD_AR_SHARD_CHECK: "
+                    f"shard [{lo}, {hi}) of {grad.numel()} max |full - shard| = {diff}"
+                )
+        else:
+            torch.distributed.all_reduce(grad, group=embd_group)
         setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
+
+
+def _emb_ar_log(msg):
+    """Print on a few ranks (MBridge filters megatron.core logger warnings)."""
+    r = torch.distributed.get_rank()
+    if r < 2 or r >= torch.distributed.get_world_size() - 2:
+        print(f"[rank {r}] {msg}", flush=True)
+
+
+# (id(param), group ranks) -> (lo, hi) element range of the param's grad to all-reduce.
+_EMBEDDING_GRAD_SHARD_CACHE: Dict[tuple, Optional[tuple]] = {}
+
+
+def _embedding_grad_shard_range(ddp_module, ddp_config, weight, grad, embd_group):
+    """Element range of ``grad`` (flattened) covering this rank's and its embedding-group peers'
+    distributed-optimizer shards, or None to reduce the whole grad.
+
+    Enabled with MLPERF_EMB_GRAD_AR_SHARD=1, and only with the distributed optimizer and a
+    reduce-scatter grad sync (the full grad is then never read outside the local shard). The
+    ranges are static, so they are exchanged once (in an eager warmup step, outside any CUDA
+    graph capture) and cached; later calls only slice.
+    """
+    if os.environ.get("MLPERF_EMB_GRAD_AR_SHARD", "0") != "1":
+        return None
+    if not ddp_config.use_distributed_optimizer or not grad.is_contiguous():
+        _emb_ar_log(f"MLPERF_EMB_GRAD_AR_SHARD: full all-reduce (distopt="
+                    f"{ddp_config.use_distributed_optimizer}, contiguous={grad.is_contiguous()})")
+        return None
+    key = (id(weight), tuple(torch.distributed.get_process_group_ranks(embd_group)))
+    if key in _EMBEDDING_GRAD_SHARD_CACHE:
+        return _EMBEDDING_GRAD_SHARD_CACHE[key]
+    if torch.cuda.is_current_stream_capturing():
+        # Never establish the ranges inside a capture: fall back to the full reduction.
+        _emb_ar_log("MLPERF_EMB_GRAD_AR_SHARD: first call inside a CUDA graph capture; full all-reduce")
+        return None
+    result = None
+    bucket_group = getattr(ddp_module, "param_to_bucket_group", {}).get(weight)
+    if bucket_group is not None and hasattr(bucket_group, "intra_distributed_optimizer_instance_size"):
+        bucket = bucket_group.param_to_bucket[weight]
+        start, end = bucket.param_to_index[weight]
+        dp_size = bucket_group.intra_distributed_optimizer_instance_size
+        dp_rank = bucket_group.intra_distributed_optimizer_instance_rank
+        assert bucket.grad_data.numel() % dp_size == 0
+        shard_size = bucket.grad_data.numel() // dp_size
+        s_lo = max(start, dp_rank * shard_size)
+        s_hi = min(end, (dp_rank + 1) * shard_size)
+        lo, hi = (s_lo - start, s_hi - start) if s_hi > s_lo else (0, 0)
+        assert end - start == grad.numel()
+        local = torch.tensor([lo, hi, 1], dtype=torch.int64, device=grad.device)
+    else:
+        _emb_ar_log(
+            f"MLPERF_EMB_GRAD_AR_SHARD: no bucket group for the embedding "
+            f"(type {type(ddp_module).__name__}, has map "
+            f"{hasattr(ddp_module, 'param_to_bucket_group')}, bucket_group {bucket_group is not None})"
+        )
+        local = torch.tensor([0, 0, 0], dtype=torch.int64, device=grad.device)
+    gathered = [torch.empty_like(local) for _ in range(get_pg_size(embd_group))]
+    torch.distributed.all_gather(gathered, local, group=embd_group)
+    ranges = [t.tolist() for t in gathered]
+    if all(ok == 1 for _, _, ok in ranges):
+        nonempty = [(a, b) for a, b, _ in ranges if b > a]
+        result = (min(a for a, _ in nonempty), max(b for _, b in nonempty)) if nonempty else (0, 0)
+        _emb_ar_log(
+            f"MLPERF_EMB_GRAD_AR_SHARD: embedding grad all-reduce over elements {result} of "
+            f"{grad.numel()} (ranges {ranges})"
+        )
+    else:
+        _emb_ar_log(f"MLPERF_EMB_GRAD_AR_SHARD: full all-reduce (ranges {ranges})")
+    _EMBEDDING_GRAD_SHARD_CACHE[key] = result
+    return result
 
 
 def _allreduce_position_embedding_grads(

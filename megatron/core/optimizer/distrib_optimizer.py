@@ -3,6 +3,7 @@
 """Megatron distributed optimizer."""
 
 import gc
+import os
 import itertools
 import logging
 from collections import ChainMap
@@ -2946,10 +2947,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             raise NotImplementedError(
                 "_copy_main_params_to_param_buffer not supported for Megatron-FSDP."
             )
+        # MLPERF_FP4_DENSE_MXFP8_PARAMS=1: MXFP8 dense params share the grad buffer for their
+        # all-gather; NVFP4 expert params do not.
+        mixed_mxfp8_nvfp4 = os.environ.get("MLPERF_FP4_DENSE_MXFP8_PARAMS", "0") == "1"
         for shard_main_group, model_group in zip(
             self.shard_fp32_from_float16_groups, self.model_float16_groups
         ):
             for shard_main_param, model_param in zip(shard_main_group, model_group):
+                if mixed_mxfp8_nvfp4 and (
+                    is_nvfp4tensor(model_param) or self._is_grouped_nvfp4_param(model_param)
+                ):
+                    # NVFP4 params keep a persistent packed param_data; quantized below.
+                    continue
                 # Get position in param buffer
                 param_range_map = self._get_model_param_range_map(model_param)
                 world_range = param_range_map["gbuf_world_in_bucket"]
@@ -2962,6 +2971,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 shard_param_buffer = param_buffer.view(-1)[world_range.start : world_range.end]
 
                 shard_param_buffer.copy_(shard_main_param)
+
+        if mixed_mxfp8_nvfp4 and self.ddp_config.fp4_param_gather:
+            # Quantize FP32 master shards back to the NVFP4 model params (rowwise only), as
+            # _copy_main_params_to_model_params does when grad-buffer reuse is off.
+            quantize_nvfp4_param_shard(
+                *self._get_nvfp4_params_and_shard_fp32_from_nvfp4(), self.data_parallel_group
+            )
 
         # Staging params into the DDP param buffer invalidates any prior "already
         # dispatched" state. The next forward pre-hook must run post-sync cleanup,

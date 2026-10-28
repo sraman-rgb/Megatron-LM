@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 import warnings
 from abc import ABC
 from contextlib import AbstractContextManager, nullcontext
@@ -219,6 +220,9 @@ def get_transformer_layer_offset(
     else:
         offset = 0
     return offset
+
+
+_ATTN_RESIDUAL_GRAD_FANIN = os.getenv("MLPERF_FUSE_ATTN_RESIDUAL_GRAD", "0") == "1"
 
 
 class MlpInterface(Protocol):
@@ -805,10 +809,47 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             input_layernorm_output, residual = input_layernorm_output
         else:
             residual = hidden_states
+            residual = self._maybe_fuse_residual_grad_into_fused_norm(hidden_states, residual)
 
         if self.config.fp32_residual_connection:
             residual = residual.float()
         return input_layernorm_output, residual, ()
+
+    def _maybe_fuse_residual_grad_into_fused_norm(self, hidden_states, residual):
+        """Fold the residual-branch gradient into the attention's fused-norm backward.
+
+        When the input norm is fused into the attention's first linear (MLA down-projection
+        fusion), autograd adds the residual gradient to the norm-backward output in a separate
+        elementwise kernel. With ``MLPERF_FUSE_ATTN_RESIDUAL_GRAD=1`` the residual gradient is
+        handed to that linear instead, whose RMSNorm backward adds it (``rmsnorm_bwd_add``).
+        """
+        if not (
+            _ATTN_RESIDUAL_GRAD_FANIN
+            and self.training
+            and torch.is_grad_enabled()
+            and hidden_states.requires_grad
+            and isinstance(self.input_layernorm, IdentityOp)
+            and not self.config.fp32_residual_connection
+            and not self.recompute_input_layernorm
+        ):
+            return residual
+        down_proj = getattr(self.self_attention, "linear_qkv_down_proj", None)
+        if (
+            down_proj is None
+            or not getattr(down_proj, "supports_grad_fanin", False)
+            or getattr(down_proj, "normalization", None) != "RMSNorm"
+        ):
+            return residual
+        from megatron.core.transformer.moe.moe_utils import GradFanIn
+
+        fanin = GradFanIn(2)
+        # Consumed (and cleared) by the down-projection's next forward call.
+        down_proj._grad_fanin = fanin
+        # The residual is tapped right before the bias-dropout-add (see
+        # _apply_self_attn_bda_step), so in backward its gradient is reported before the
+        # attention backward reaches the down-projection.
+        self._attn_residual_grad_fanin = fanin
+        return residual
 
     def _apply_self_attn_bda_step(self, attention_output_with_bias, residual, attn_state=()):
         """bias-dropout-add for self-attention output + post-step offload commit.
@@ -822,6 +863,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
+        residual_fanin = self.__dict__.pop("_attn_residual_grad_fanin", None)
+        if residual_fanin is not None:
+            from megatron.core.transformer.moe.moe_utils import GradFanInTap
+
+            residual = GradFanInTap.apply(residual, residual_fanin)
         nvtx_range_push(suffix="self_attn_bda")
         if using_fused_tp_inference_kernel:
             # In inference optimized transformer layer, there is no bias and dropout

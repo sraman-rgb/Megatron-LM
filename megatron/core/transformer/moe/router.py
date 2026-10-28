@@ -30,6 +30,50 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _count_routing_map_kernel(
+        map_ptr, out_ptr, num_rows, NUM_EXPERTS: tl.constexpr, BLOCK_R: tl.constexpr
+    ):
+        """Add the per-expert token counts of a [num_rows, NUM_EXPERTS] bool map to out."""
+        rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+        cols = tl.arange(0, NUM_EXPERTS)
+        mask = rows[:, None] < num_rows
+        vals = tl.load(map_ptr + rows[:, None] * NUM_EXPERTS + cols[None, :], mask=mask, other=0)
+        counts = tl.sum(vals.to(tl.int32), axis=0)
+        tl.atomic_add(out_ptr + cols, counts.to(tl.int64))
+
+    _HAVE_TRITON = True
+except ImportError:  # pragma: no cover
+    _HAVE_TRITON = False
+
+
+def _accumulate_tokens_per_expert(routing_map: torch.Tensor, out: torch.Tensor) -> bool:
+    """Add routing_map.sum(dim=0) to the int64 buffer ``out`` in one kernel.
+
+    Integer atomics make the result exact and order independent, so it matches the
+    reference sum bit for bit. Returns False when the fast path does not apply.
+    """
+    num_experts = routing_map.shape[-1]
+    if (
+        not _HAVE_TRITON
+        or routing_map.dtype != torch.bool
+        or routing_map.dim() != 2
+        or not routing_map.is_contiguous()
+        or out.dtype != torch.int64
+        or num_experts & (num_experts - 1) != 0
+    ):
+        return False
+    num_rows = routing_map.shape[0]
+    block_r = 64
+    _count_routing_map_kernel[(triton.cdiv(num_rows, block_r),)](
+        routing_map.view(torch.uint8), out, num_rows, NUM_EXPERTS=num_experts, BLOCK_R=block_r
+    )
+    return True
+
 
 class Router(ABC, MegatronModule):
     """Base Router class"""
@@ -735,7 +779,6 @@ class TopKRouter(Router):
         else:
             return input
 
-    @jit_fuser
     def _apply_expert_bias(
         self, routing_map: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
     ):
@@ -745,9 +788,20 @@ class TopKRouter(Router):
         """
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
-                if padding_mask is not None:
-                    routing_map = routing_map & (~padding_mask).unsqueeze(-1)
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+                if padding_mask is None and _accumulate_tokens_per_expert(
+                    routing_map, self.local_tokens_per_expert
+                ):
+                    return
+                self._apply_expert_bias_reference(routing_map, padding_mask)
+
+    @jit_fuser
+    def _apply_expert_bias_reference(
+        self, routing_map: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ):
+        """Reference token counting, used when the single-kernel path does not apply."""
+        if padding_mask is not None:
+            routing_map = routing_map & (~padding_mask).unsqueeze(-1)
+        self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Top-k routing function

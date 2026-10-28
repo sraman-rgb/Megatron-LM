@@ -16,6 +16,7 @@ from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layo
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
+from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
@@ -1455,8 +1456,8 @@ class MultiTokenPredictionLayer(MegatronModule):
         """Return the quantization context for fine-grained MTP execution."""
         if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
             return get_fp8_context(self.config)
-
-        # FP4 in MTP layers still needs numerical validation.
+        if self.config.fp4:
+            return get_fp4_context(self.config)
         return nullcontext()
 
     def _get_embeddings(
@@ -1646,6 +1647,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         if self.config.fp8:
             fp8_context = get_fp8_context(self.config)
             transformer_layer_fp8_context = get_fp8_context(self.config)
+        elif self.config.fp4:
+            fp8_context = get_fp4_context(self.config)
+            transformer_layer_fp8_context = get_fp4_context(self.config)
         else:
             fp8_context = nullcontext()
             transformer_layer_fp8_context = nullcontext()
@@ -2303,7 +2307,10 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         def build_layer_legacy(layer_spec, layer_number):
             """Build layer using legacy spec-based approach."""
-            fp8_init_context = get_fp8_context(self.config, is_init=True)
+            if self.config.fp4:
+                fp8_init_context = get_fp4_context(self.config, is_init=True)
+            else:
+                fp8_init_context = get_fp8_context(self.config, is_init=True)
             with fp8_init_context:
                 module = build_module(
                     layer_spec,
@@ -2320,7 +2327,10 @@ class MultiTokenPredictionBlock(MegatronModule):
             layer_spec, layer_number, mtp_layer_pattern, hybrid_submodules
         ):
             """Build layer using pattern-based approach (new Mamba path)."""
-            fp8_init_context = get_fp8_context(self.config, is_init=True)
+            if self.config.fp4:
+                fp8_init_context = get_fp4_context(self.config, is_init=True)
+            else:
+                fp8_init_context = get_fp8_context(self.config, is_init=True)
             with fp8_init_context:
                 module = build_module(
                     layer_spec,

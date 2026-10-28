@@ -325,7 +325,11 @@ class DistributedDataParallelConfig:
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
 
         if self.reuse_grad_buf_for_mxfp8_param_ag:
-            assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+            # MLPERF_FP4_DENSE_MXFP8_PARAMS=1 keeps the MXFP8 dense params of an FP4 model
+            # (fp4_param_gather) on the grad-buffer all-gather path.
+            assert self.fp8_param_gather or (
+                os.environ.get("MLPERF_FP4_DENSE_MXFP8_PARAMS", "0") == "1"
+            ), "Reuse grad buffer only when keeping params in MXFP8."
 
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
