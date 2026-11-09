@@ -292,5 +292,9 @@ class TestCrossEntropyMxfp8Grad:
 
         assert ref[3] is torch.Tensor
         assert issubclass(out[3], MXFP8Tensor)
+        from megatron.core.extensions import transformer_engine as te_ext
+
+        quantizer = te_ext._mxfp8_grad_quantizer(expected_format)
+        assert quantizer.optimize_for_gemm == te_ext._TE_CE_WRITES_SWIZZLED_MXFP8_GRAD
         for name, a, b in zip(("loss", "weight grad", "input grad"), out[:3], ref[:3]):
             assert torch.equal(a, b), name

@@ -4058,7 +4058,19 @@ try:
         fp8_dtypes = {"e4m3": tex.DType.kFloat8E4M3, "e5m2": tex.DType.kFloat8E5M2}
         if grad_fp8_format not in fp8_dtypes:
             raise ValueError(f"grad_fp8_format must be 'e4m3' or 'e5m2', got {grad_fp8_format!r}")
-        return MXFP8Quantizer(fp8_dtypes[grad_fp8_format], rowwise=True, columnwise=True)
+        quantizer = MXFP8Quantizer(fp8_dtypes[grad_fp8_format], rowwise=True, columnwise=True)
+        # The LM head's GEMMs use the scaling factors in the GEMM-swizzled layout, as TE's own
+        # gradient quantizer produces them. Ask for that layout when TE's cross entropy can
+        # write it from the loss kernel; otherwise the GEMMs swizzle compact scales.
+        quantizer.optimize_for_gemm = _TE_CE_WRITES_SWIZZLED_MXFP8_GRAD
+        return quantizer
+
+    try:
+        import transformer_engine_torch as _tex
+
+        _TE_CE_WRITES_SWIZZLED_MXFP8_GRAD = hasattr(_tex, "cross_entropy_backward_mxfp8")
+    except ImportError:
+        _TE_CE_WRITES_SWIZZLED_MXFP8_GRAD = False
 
 except ImportError:
     te_parallel_cross_entropy = None  # type: ignore[assignment, misc]
