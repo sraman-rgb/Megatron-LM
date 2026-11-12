@@ -266,6 +266,47 @@ def get_capacity(
     return capacity
 
 
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _count_tokens_per_expert_kernel(
+        map_ptr, out_ptr, num_rows, NUM_EXPERTS: tl.constexpr, BLOCK_R: tl.constexpr
+    ):
+        """Add the per-expert token counts of a [num_rows, NUM_EXPERTS] bool map to out."""
+        rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+        cols = tl.arange(0, NUM_EXPERTS)
+        mask = rows[:, None] < num_rows
+        vals = tl.load(map_ptr + rows[:, None] * NUM_EXPERTS + cols[None, :], mask=mask, other=0)
+        counts = tl.sum(vals.to(tl.int32), axis=0)
+        tl.atomic_add(out_ptr + cols, counts.to(tl.int64))
+
+    _HAVE_TRITON_COUNT = True
+except ImportError:  # pragma: no cover
+    _HAVE_TRITON_COUNT = False
+
+
+def _routing_map_column_counts(routing_map: torch.Tensor) -> torch.Tensor:
+    """``routing_map.sum(dim=0)`` for a 2D bool map, exact (integer atomics), in one kernel."""
+    num_experts = routing_map.shape[-1]
+    if (
+        not _HAVE_TRITON_COUNT
+        or routing_map.dtype != torch.bool
+        or routing_map.dim() != 2
+        or not routing_map.is_contiguous()
+        or num_experts & (num_experts - 1) != 0
+    ):
+        return routing_map.sum(dim=0)
+    out = torch.zeros(num_experts, dtype=torch.int64, device=routing_map.device)
+    num_rows = routing_map.shape[0]
+    block_r = 64
+    _count_tokens_per_expert_kernel[(triton.cdiv(num_rows, block_r),)](
+        routing_map.view(torch.uint8), out, num_rows, NUM_EXPERTS=num_experts, BLOCK_R=block_r
+    )
+    return out
+
+
 def get_tokens_per_expert_and_token_count(
     routing_map: torch.Tensor,
     reduce_group: torch.distributed.ProcessGroup,
@@ -275,7 +316,7 @@ def get_tokens_per_expert_and_token_count(
     """
     Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.
     """
-    local_tokens_per_expert = routing_map.sum(dim=0)
+    local_tokens_per_expert = _routing_map_column_counts(routing_map)
     global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
         local_tokens_per_expert, reduce_group
     )
@@ -1360,6 +1401,58 @@ def apply_biased_logits(logits, std, layer_number=None):
     return RandomSTEShared.apply(logits, std, layer_number)
 
 
+
+class GradFanIn:
+    """Sums the gradients a tensor receives from several consumers into one buffer.
+
+    Each consumer reports its contribution once. A consumer whose gradient comes from a GEMM can
+    write it straight into the running sum with ``accumulate=True`` (see ``accum_target``), which
+    removes the separate elementwise add autograd would otherwise launch. Only the last consumer
+    hands the sum back to autograd; the others return ``None``. Any arrival order is correct; the
+    fused path is taken when the GEMM consumers arrive after the first contribution.
+    """
+
+    def __init__(self, num_consumers: int):
+        self.num_consumers = num_consumers
+        self.seen = 0
+        self.acc = None
+
+    def accum_target(self) -> Optional[torch.Tensor]:
+        """Running sum to accumulate into in place, or ``None`` before the first contribution."""
+        return self.acc
+
+    def finish(self, grad: Optional[torch.Tensor], accumulated: bool) -> Optional[torch.Tensor]:
+        """Record one contribution. ``accumulated`` means ``grad`` already includes the sum."""
+        if grad is not None:
+            if accumulated or self.acc is None:
+                self.acc = grad
+            else:
+                self.acc.add_(grad)
+        self.seen += 1
+        if self.seen == self.num_consumers:
+            out, self.acc = self.acc, None
+            return out
+        return None
+
+
+class GradFanInTap(torch.autograd.Function):
+    """Identity whose backward reports the incoming gradient to a ``GradFanIn``."""
+
+    @staticmethod
+    def forward(ctx, inp: torch.Tensor, fanin: GradFanIn) -> torch.Tensor:
+        ctx.fanin = fanin
+        return inp.view_as(inp)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        fanin = ctx.fanin
+        ctx.fanin = None
+        return fanin.finish(grad, accumulated=False), None
+
+
+# Set by MoELayer.route() so the router gating GEMM can join the MoE input fan-in.
+_ACTIVE_ROUTER_FANIN: Optional[GradFanIn] = None
+
 class RouterGatingLinearFunction(torch.autograd.Function):
     """
     Autograd function for router gating linear.
@@ -1386,6 +1479,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             torch.Tensor: The output tensor.
         """
         ctx.save_for_backward(inp, weight, bias)
+        ctx.fanin = _ACTIVE_ROUTER_FANIN
         ctx.router_dtype = router_dtype
         ctx.input_dtype = inp.dtype
         ctx.weight_dtype = weight.dtype
@@ -1428,14 +1522,41 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
         grad_output = grad_output.view(-1, grad_shape[-1])
 
+        fanin = ctx.fanin
+        ctx.fanin = None
+        acc = fanin.accum_target() if fanin is not None else None
+        accumulated = False
         if te_general_gemm is not None and ctx.router_dtype != torch.float64:
-            grad_input = te_general_gemm(
-                weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
-            )
+            if (
+                acc is not None
+                and ctx.router_dtype == ctx.input_dtype
+                and acc.dtype == ctx.input_dtype
+                and acc.is_contiguous()
+                and acc.numel() == inp.numel()
+            ):
+                # dx += dlogits @ W in the GEMM epilogue instead of a separate add.
+                from transformer_engine.pytorch.cpp_extensions import general_gemm
+
+                acc2d = acc.view(-1, inp_shape[-1])
+                general_gemm(
+                    weight.to(ctx.router_dtype),
+                    grad_output,
+                    out_dtype=ctx.router_dtype,
+                    layout="NN",
+                    grad=True,
+                    out=acc2d,
+                    accumulate=True,
+                )
+                grad_input = acc2d
+                accumulated = True
+            else:
+                grad_input = te_general_gemm(
+                    weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
+                )[0]
             grad_weight = te_general_gemm(
                 inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
             )
-            grad_input = grad_input[0].to(ctx.input_dtype)
+            grad_input = grad_input.to(ctx.input_dtype)
             grad_weight = grad_weight[0].to(ctx.weight_dtype)
         else:
             grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
@@ -1443,6 +1564,8 @@ class RouterGatingLinearFunction(torch.autograd.Function):
 
         grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)
+        if fanin is not None:
+            grad_input = fanin.finish(grad_input, accumulated=accumulated)
         return grad_input, grad_weight, grad_bias, None
 
 

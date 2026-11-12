@@ -4,12 +4,33 @@
 
 import gc
 import logging
+import os
+import time
 
 import torch
 
 from megatron.core.tensor_parallel.random import get_all_rng_states
 
 logger = logging.getLogger(__name__)
+
+# MLPERF_STEP_BOUNDARY=1 (overlay_stepb): cheaper step boundary for the full-iteration graph.
+#   MLPERF_STEP_BOUNDARY_STAGE=stack (default with the switch) | dedup | off
+#     dedup: stage each microbatch once per step instead of once per VPP chunk (every chunk of
+#            microbatch b shares static buffer b and the last chunk's copy wins, so only that
+#            one is staged), all copies under one stream switch and one wait_stream pair.
+#     stack: dedup + the per-key static buffers of all microbatches are views into one
+#            contiguous [num_microbatches, ...] tensor, filled by a single H2D copy per key
+#            from a reused pinned staging tensor (torch.stack of the dataloader tensors).
+#     The static buffers hold the same bytes as with the original per-microbatch copies.
+#   MLPERF_STEP_BOUNDARY_EARLY_WAIT=1 (default with the switch): after a graph replay the
+#     staging stream waits on an event recorded right after the replay (the last reader of the
+#     static buffers) instead of on everything queued on the current stream since (e.g. eager
+#     param casts at the step start), so the H2D copies overlap that work.
+#   MLPERF_STEP_BOUNDARY_TIMING=1: print host time of the staging per step (rank 0 and last).
+_SB = os.environ.get('MLPERF_STEP_BOUNDARY', '0') == '1'
+_SB_STAGE = os.environ.get('MLPERF_STEP_BOUNDARY_STAGE', 'stack') if _SB else 'off'
+_SB_EARLY_WAIT = _SB and os.environ.get('MLPERF_STEP_BOUNDARY_EARLY_WAIT', '1') == '1'
+_SB_TIMING = os.environ.get('MLPERF_STEP_BOUNDARY_TIMING', '0') == '1'
 
 # Process-wide handle so full-iter and optimizer graph captures share one pool and one
 # non-default stream (per-stream alloc segments can inflate memory_reserved; see
@@ -101,8 +122,164 @@ class StaticBufferLoader:
 
     static_buffers: dict = {'training': [], 'validation': []}
 
+    # overlay_stepb state, class-level like static_buffers (the warmup callback's wrapper
+    # captures the graph and fills the buffers; the training loop's wrapper replays it).
+    sb_big: dict = {}  # stage -> {key: cuda tensor [num_mb, ...]}; static buffers are its views
+    sb_pin: dict = {}  # stage -> {key: pinned cpu tensor [num_mb, ...]} for cpu sources
+    sb_h2d_done: dict = {}  # stage -> event after the last H2D out of the pinned tensors
+    consumed_event: dict = {}  # stage -> event after the last graph replay (reader of the buffers)
+
     def __init__(self):
         self.stream = torch.cuda.Stream()
+
+    @staticmethod
+    def _normalize(inputs):
+        if isinstance(inputs, tuple) and isinstance(inputs[0], dict):
+            inputs = inputs[0]
+        assert isinstance(inputs, dict)
+        return inputs
+
+    sb_views_ok: dict = {}  # stage -> (num_mb, frozenset of keys verified to be views of sb_big)
+
+    @staticmethod
+    def _any_cuda(x):
+        if isinstance(x, torch.Tensor):
+            return x.is_cuda
+        if isinstance(x, (tuple, list)):
+            return any(StaticBufferLoader._any_cuda(i) for i in x)
+        if isinstance(x, dict):
+            return any(StaticBufferLoader._any_cuda(i) for i in x.values())
+        return False
+
+    def _wait_for_consumers(self, stage, all_cpu):
+        # The early wait only orders after the readers of the static buffers, so it needs all
+        # sources to be host tensors (nothing produced on the current stream to wait for).
+        ev = StaticBufferLoader.consumed_event.pop(stage, None)
+        if ev is not None and _SB_EARLY_WAIT and all_cpu:
+            self.stream.wait_event(ev)
+        else:
+            self.stream.wait_stream(torch.cuda.current_stream())
+
+    @staticmethod
+    def _stackable(norm):
+        """{key: (shape, dtype)} of keys that hold, in every microbatch, a contiguous cpu/cuda
+        tensor of one shape, dtype and device."""
+        keys = {}
+        for k, v in norm[0].items():
+            if not isinstance(v, torch.Tensor) or not v.is_contiguous():
+                continue
+            if v.device.type not in ('cpu', 'cuda'):
+                continue
+            ok = True
+            for d in norm[1:]:
+                w = d.get(k, None)
+                if (
+                    not isinstance(w, torch.Tensor)
+                    or w.shape != v.shape
+                    or w.dtype != v.dtype
+                    or w.device != v.device
+                    or not w.is_contiguous()
+                ):
+                    ok = False
+                    break
+            if ok:
+                keys[k] = (tuple(v.shape), v.dtype)
+        return keys
+
+    @staticmethod
+    def _stage_rest(static, inputs, skip):
+        """Original per-microbatch semantics (StaticBufferLoader.__call__ else-branch) for the
+        keys not in skip; runs on the current (staging) stream."""
+        for k in inputs.keys():
+            if k in skip:
+                continue
+            if k not in static:
+                if isinstance(inputs[k], torch.Tensor):
+                    static[k] = torch.empty_like(inputs[k], device="cuda")
+                else:
+                    static[k] = inputs[k]
+        clone_tensors_in_struct(static, {k: v for k, v in inputs.items() if k not in skip})
+
+    def load_all(self, batches, stage):
+        """Stage one input dict per microbatch (list index = microbatch) into the static buffers.
+
+        Leaves the same bytes in the static buffers as calling self(batches[b], stage, b) for
+        every b in order, with one wait_stream pair and (stack mode) one H2D copy per key.
+        Returns the list of static buffer dicts.
+        """
+        assert stage in ['training', 'validation']
+        bufs = StaticBufferLoader.static_buffers[stage]
+        norm = [self._normalize(x) for x in batches]
+        n = len(norm)
+        if n == 0:
+            return []
+        if len(bufs) == 0 and _SB_STAGE == 'stack':
+            # First call: allocate one contiguous [n, ...] buffer per stackable key; the
+            # per-microbatch static buffers are its row views (contiguous, same shape/dtype
+            # as the clone the original path makes).
+            stk = self._stackable(norm)
+            big = {k: torch.empty((n,) + shp, dtype=dt, device='cuda') for k, (shp, dt) in stk.items()}
+            for b in range(n):
+                bufs.append(
+                    {k: (big[k][b] if k in big else copy_tensors_in_struct(v)) for k, v in norm[b].items()}
+                )
+            StaticBufferLoader.sb_big[stage] = big
+            StaticBufferLoader.sb_pin[stage] = {}
+        if len(bufs) < n:
+            # more microbatches than buffers (not expected): original path
+            return [self(norm[b], stage, b) for b in range(n)]
+        big = StaticBufferLoader.sb_big.get(stage, {}) if _SB_STAGE == 'stack' else {}
+        stk = {}
+        if big:
+            cand = self._stackable(norm)
+            ok = StaticBufferLoader.sb_views_ok.get(stage)
+            if ok is None or ok[0] != n:
+                ok = (
+                    n,
+                    frozenset(
+                        k
+                        for k, t in big.items()
+                        if t.shape[0] == n
+                        and all(
+                            isinstance(bufs[b].get(k), torch.Tensor)
+                            and bufs[b][k].data_ptr() == t[b].data_ptr()
+                            and bufs[b][k].shape == t[b].shape
+                            for b in range(n)
+                        )
+                    ),
+                )
+                StaticBufferLoader.sb_views_ok[stage] = ok
+            for k, (shp, dt) in cand.items():
+                t = big.get(k)
+                if k in ok[1] and tuple(t.shape[1:]) == shp and t.dtype == dt:
+                    stk[k] = norm[0][k].device.type
+        pin = StaticBufferLoader.sb_pin.setdefault(stage, {})
+        if any(dev == 'cpu' for dev in stk.values()):
+            done = StaticBufferLoader.sb_h2d_done.get(stage)
+            if done is not None:
+                done.synchronize()  # pinned staging tensors are free again (long done)
+            for k, dev in stk.items():
+                if dev != 'cpu':
+                    continue
+                if k not in pin:
+                    pin[k] = torch.empty(big[k].shape, dtype=big[k].dtype, pin_memory=True)
+                torch.stack([d[k] for d in norm], out=pin[k])
+        self._wait_for_consumers(stage, not any(self._any_cuda(d) for d in norm))
+        with torch.cuda.stream(self.stream):
+            for k, dev in stk.items():
+                if dev == 'cpu':
+                    big[k].copy_(pin[k], non_blocking=True)
+                else:
+                    torch.stack([d[k] for d in norm], out=big[k])
+            skip = set(stk)
+            for b in range(n):
+                self._stage_rest(bufs[b], norm[b], skip)
+            if stk:
+                ev = torch.cuda.Event()
+                ev.record(self.stream)
+                StaticBufferLoader.sb_h2d_done[stage] = ev
+        torch.cuda.current_stream().wait_stream(self.stream)
+        return bufs[:n]
 
     def __call__(self, inputs, stage, microbatch):
         assert stage in ['training', 'validation']
@@ -148,7 +325,46 @@ class FullCudaGraphWrapper:
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
         self.use_single_mempool = use_single_mempool
 
+    def _sb_data_read(self, data_iterator, model, training, num_microbatches):
+        """overlay_stepb data_read: same iterator consumption and final buffer contents."""
+        stage = 'training' if training else 'validation'
+        t0 = time.perf_counter() if _SB_TIMING else None
+        single = not isinstance(model, list) or len(model) == 1
+        if single:
+            assert not isinstance(data_iterator, list) or len(data_iterator) == 1
+            its = [data_iterator if not isinstance(data_iterator, list) else data_iterator[0]]
+        else:
+            assert isinstance(data_iterator, list) and len(data_iterator) == len(model)
+            its = data_iterator
+        per_chunk = []
+        for it in its:
+            per_chunk.append(None if it is None else [next(it) for _ in range(num_microbatches)])
+        # Every chunk stages microbatch b into the same static buffer b, in chunk order, so the
+        # last chunk with data determines the final contents.
+        finals = None
+        for bl in per_chunk:
+            if bl is not None:
+                finals = bl
+        statics = None if finals is None else self.static_loader.load_all(finals, stage)
+        if single:
+            out = [None] if statics is None else [iter(statics)]
+        else:
+            out = [None if bl is None else iter(list(statics)) for bl in per_chunk]
+        if _SB_TIMING:
+            self._sb_t_stage = time.perf_counter() - t0
+        return out
+
     def data_read(self, data_iterator, model, training, num_microbatches):
+        """Read all microbatch inputs from Dataloader and copy to static buffers."""
+        if _SB_STAGE != 'off':
+            return self._sb_data_read(data_iterator, model, training, num_microbatches)
+        t0 = time.perf_counter() if _SB_TIMING else None
+        out = self._orig_data_read(data_iterator, model, training, num_microbatches)
+        if _SB_TIMING:
+            self._sb_t_stage = time.perf_counter() - t0
+        return out
+
+    def _orig_data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
         if not isinstance(model, list) or len(model) == 1:
             assert not isinstance(data_iterator, list) or len(data_iterator) == 1
@@ -239,6 +455,19 @@ class FullCudaGraphWrapper:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
         else:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
+            if _SB_EARLY_WAIT:
+                ev = torch.cuda.Event()
+                ev.record(torch.cuda.current_stream())
+                StaticBufferLoader.consumed_event[training_str] = ev
+        if _SB_TIMING:
+            _r = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            _w = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            if _r in (0, _w - 1):
+                print(
+                    f"[stepb] rank {_r} {training_str} iter {self.curr_iter(training_str)} "
+                    f"stage_host_ms {1e3 * getattr(self, '_sb_t_stage', 0.0):.2f} mode {_SB_STAGE}",
+                    flush=True,
+                )
         self.next_iter(training_str)
         return FullCudaGraphWrapper.result[training_str]
 

@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from abc import ABC, abstractmethod
 from typing import Optional, Union
 
@@ -29,6 +30,63 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+# MLPERF_FUSED_TOPK256=1: one fused kernel for the 256-expert sigmoid / group-limited top-8 router, the seq aux
+# loss scores and counts, the expert-bias counts and the dispatcher's top-k (see fused_topk256.py).
+_FUSED_TOPK256 = os.getenv("MLPERF_FUSED_TOPK256", "0") == "1"
+_ft256 = None
+if _FUSED_TOPK256:
+    try:
+        from megatron.core.transformer.moe import fused_topk256 as _ft256
+
+        if not _ft256.available():
+            _ft256 = None
+    except ImportError:  # pragma: no cover
+        _ft256 = None
+
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _count_routing_map_kernel(
+        map_ptr, out_ptr, num_rows, NUM_EXPERTS: tl.constexpr, BLOCK_R: tl.constexpr
+    ):
+        """Add the per-expert token counts of a [num_rows, NUM_EXPERTS] bool map to out."""
+        rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+        cols = tl.arange(0, NUM_EXPERTS)
+        mask = rows[:, None] < num_rows
+        vals = tl.load(map_ptr + rows[:, None] * NUM_EXPERTS + cols[None, :], mask=mask, other=0)
+        counts = tl.sum(vals.to(tl.int32), axis=0)
+        tl.atomic_add(out_ptr + cols, counts.to(tl.int64))
+
+    _HAVE_TRITON = True
+except ImportError:  # pragma: no cover
+    _HAVE_TRITON = False
+
+
+def _accumulate_tokens_per_expert(routing_map: torch.Tensor, out: torch.Tensor) -> bool:
+    """Add routing_map.sum(dim=0) to the int64 buffer ``out`` in one kernel.
+
+    Integer atomics make the result exact and order independent, so it matches the
+    reference sum bit for bit. Returns False when the fast path does not apply.
+    """
+    num_experts = routing_map.shape[-1]
+    if (
+        not _HAVE_TRITON
+        or routing_map.dtype != torch.bool
+        or routing_map.dim() != 2
+        or not routing_map.is_contiguous()
+        or out.dtype != torch.int64
+        or num_experts & (num_experts - 1) != 0
+    ):
+        return False
+    num_rows = routing_map.shape[0]
+    block_r = 64
+    _count_routing_map_kernel[(triton.cdiv(num_rows, block_r),)](
+        routing_map.view(torch.uint8), out, num_rows, NUM_EXPERTS=num_experts, BLOCK_R=block_r
+    )
+    return True
 
 
 class Router(ABC, MegatronModule):
@@ -735,7 +793,6 @@ class TopKRouter(Router):
         else:
             return input
 
-    @jit_fuser
     def _apply_expert_bias(
         self, routing_map: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
     ):
@@ -745,9 +802,20 @@ class TopKRouter(Router):
         """
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
-                if padding_mask is not None:
-                    routing_map = routing_map & (~padding_mask).unsqueeze(-1)
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+                if padding_mask is None and _accumulate_tokens_per_expert(
+                    routing_map, self.local_tokens_per_expert
+                ):
+                    return
+                self._apply_expert_bias_reference(routing_map, padding_mask)
+
+    @jit_fuser
+    def _apply_expert_bias_reference(
+        self, routing_map: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ):
+        """Reference token counting, used when the single-kernel path does not apply."""
+        if padding_mask is not None:
+            routing_map = routing_map & (~padding_mask).unsqueeze(-1)
+        self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Top-k routing function
@@ -772,6 +840,9 @@ class TopKRouter(Router):
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
+
+        if _ft256 is not None and self._fused_topk256_applicable(logits, padding_mask, bsz):
+            return self._routing_fused_topk256(logits, seq_length, bsz)
 
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
@@ -841,6 +912,58 @@ class TopKRouter(Router):
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
         return probs, routing_map
+
+    def _fused_topk256_applicable(self, logits, padding_mask, bsz) -> bool:
+        """MLPERF_FUSED_TOPK256 fast path: DeepSeek-V3 routing with only the seq aux loss, training."""
+        cfg = self.config
+        return (
+            self.training
+            and torch.is_grad_enabled()
+            and padding_mask is None
+            and bsz == 1
+            and self.routing_type == "seq_aux_loss"
+            and self.get_aux_loss_coeff("seq_aux_loss") > 0
+            and self.score_function == "sigmoid"
+            and self.topk == 8
+            and cfg.num_moe_experts in (256, 16)
+            and cfg.moe_router_num_groups == 8
+            and cfg.moe_router_group_topk == 4
+            and cfg.moe_router_fusion
+            and cfg.moe_expert_capacity_factor is None
+            and self.router_replay is None
+            and cfg.moe_token_dispatcher_type == "flex"
+            and cfg.moe_flex_dispatcher_backend == "ncclep"
+            and (cfg.expert_tensor_parallel_size or 1) == 1
+            and _ft256.supported(logits, self.expert_bias)
+        )
+
+    def _routing_fused_topk256(self, logits, seq_length, bsz):
+        """Same outputs as the TE path + dispatcher top-k, returned in the dispatcher's compact form:
+        (token_probs [T, 8], token_indices [T, 8] int64)."""
+        from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
+
+        coeff = self.get_aux_loss_coeff("seq_aux_loss")
+        group = self.tp_cp_group
+        bias_counts = self.local_tokens_per_expert if self.enable_expert_bias else None
+        token_probs, token_indices, aux_loss = _ft256.fused_topk256(
+            logits,
+            self.expert_bias,
+            bias_counts,
+            self.config.moe_router_topk_scaling_factor,
+            coeff,
+            lambda t: reduce_from_tensor_model_parallel_region(t, group),
+            group.size(),
+        )
+        aux_loss = aux_loss / bsz
+        probs = self.attach_and_log_load_balancing_loss(
+            token_probs,
+            coeff,
+            aux_loss,
+            "seq_load_balancing_loss",
+            self.tp_cp_group,
+            valid_token_count=seq_length * bsz,
+        )
+        return probs, token_indices
 
     def reset_global_aux_loss_tracker(self):
         """Reset the global aux loss tracker."""

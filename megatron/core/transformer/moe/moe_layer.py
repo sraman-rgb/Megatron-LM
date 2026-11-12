@@ -6,6 +6,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
+import os
+
 import torch
 
 from megatron.core import tensor_parallel, utils
@@ -15,7 +17,10 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_rout
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe import moe_utils as _moe_utils
 from megatron.core.transformer.moe.moe_utils import (
+    GradFanIn,
+    GradFanInTap,
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
     get_default_pg_collection,
@@ -148,6 +153,9 @@ class RouterBuilder(Protocol):
     def __call__(
         self, /, *, config: TransformerConfig, pg_collection: ProcessGroupCollection | None
     ) -> RouterInterface: ...
+
+
+_MOE_INPUT_GRAD_FANIN = os.getenv("MLPERF_FUSE_MOE_INPUT_GRAD", "0") == "1"
 
 
 @dataclass
@@ -463,13 +471,53 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
     @maybe_skip_or_early_return_by_cudagraph("route")
+    def _input_grad_fanin(self, hidden_states: torch.Tensor) -> Optional[GradFanIn]:
+        """Gradient fan-in for the MoE input, shared by the shared expert, router and dispatch.
+
+        With ``MLPERF_FUSE_MOE_INPUT_GRAD=1`` the three input gradients are summed in one buffer:
+        the dispatch gradient seeds it and the router and shared-expert dgrad GEMMs accumulate
+        into it, instead of autograd adding them with two separate elementwise kernels.
+        ``shared_experts_compute``, ``route`` and ``preprocess`` are called on the same tensor
+        in that order; the first call creates the fan-in and ``preprocess`` releases it.
+        """
+        if not (
+            _MOE_INPUT_GRAD_FANIN
+            and self.training
+            and torch.is_grad_enabled()
+            and hidden_states.requires_grad
+            and self.config.moe_input_jitter_eps is None
+            and not self.config.moe_latent_size
+        ):
+            return None
+        cur = getattr(self, "_grad_fanin_cur", None)
+        if cur is not None and cur[0] is hidden_states:
+            return cur[1]
+        num_consumers = 2
+        if self.use_shared_expert and not self.shared_expert_overlap:
+            if self.shared_experts_recompute or getattr(
+                self.shared_experts, "use_shared_expert_gate", False
+            ):
+                return None
+            num_consumers = 3
+        fanin = GradFanIn(num_consumers)
+        self._grad_fanin_cur = (hidden_states, fanin)
+        return fanin
+
     def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        fanin = self._input_grad_fanin(hidden_states)
+        if fanin is None:
+            probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+            return probs, routing_map
+        _moe_utils._ACTIVE_ROUTER_FANIN = fanin
+        try:
+            probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        finally:
+            _moe_utils._ACTIVE_ROUTER_FANIN = None
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -506,6 +554,10 @@ class MoELayer(BaseMoELayer):
                     "inference dispatcher. Either disable moe_shared_expert_overlap or set "
                     "inference_moe_token_dispatcher_type='nvls'."
                 )
+        fanin = self._input_grad_fanin(hidden_states)
+        if fanin is not None:
+            self._grad_fanin_cur = None
+            hidden_states = GradFanInTap.apply(hidden_states, fanin)
         # Project the hidden_states from hidden dimension down to latent dimension.
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
@@ -549,7 +601,22 @@ class MoELayer(BaseMoELayer):
                         apply_module(self.shared_experts), False, hidden_states
                     )
             else:
-                shared_expert_output = apply_module(self.shared_experts)(hidden_states)
+                fanin = self._input_grad_fanin(hidden_states)
+                if fanin is None:
+                    shared_expert_output = apply_module(self.shared_experts)(hidden_states)
+                else:
+                    fc1 = self.shared_experts.linear_fc1
+                    if getattr(fc1, "supports_grad_fanin", False):
+                        # fc1's dgrad GEMM accumulates into the fan-in buffer.
+                        fc1._grad_fanin = fanin
+                        try:
+                            shared_expert_output = apply_module(self.shared_experts)(hidden_states)
+                        finally:
+                            fc1._grad_fanin = None
+                    else:
+                        shared_expert_output = apply_module(self.shared_experts)(
+                            GradFanInTap.apply(hidden_states, fanin)
+                        )
 
         return shared_expert_output
 

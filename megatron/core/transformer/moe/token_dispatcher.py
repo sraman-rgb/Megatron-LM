@@ -48,6 +48,9 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+# MLPERF_FUSED_TOPK256=1: accept the router's compact (token_probs, token_indices), see dispatch_preprocess.
+_FUSED_TOPK256 = os.getenv("MLPERF_FUSED_TOPK256", "0") == "1"
+
 """ We use the following notation throughout this file:
      H: hidden size
      B: micro batch size
@@ -1944,6 +1947,28 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         self._comm_manager.setup_metadata(routing_map, probs)
         return hidden_states, self._comm_manager.token_probs
+
+    if _FUSED_TOPK256:
+        _dispatch_preprocess_dense = dispatch_preprocess
+
+        def dispatch_preprocess(
+            self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
+        ):
+            """MLPERF_FUSED_TOPK256: the router may hand over the dispatcher's top-k directly,
+            routing_map = token_indices [T, topk] int64 and probs = token_probs [T, topk] (exactly what
+            setup_metadata's torch.topk would produce); otherwise the dense path above."""
+            if routing_map.dtype != torch.int64:
+                return self._dispatch_preprocess_dense(hidden_states, routing_map, probs)
+            assert self.tp_size == 1 and isinstance(self._comm_manager, _NCCLEPManager), (
+                "MLPERF_FUSED_TOPK256 compact routing needs the NCCL-EP flex dispatcher with TP=1"
+            )
+            self.hidden_shape = hidden_states.shape
+            hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+            cm = self._comm_manager
+            cm.token_probs = probs
+            cm.token_indices = routing_map
+            cm.num_local_tokens = routing_map.shape[0]
+            return hidden_states, cm.token_probs
 
     def token_dispatch(
         self,

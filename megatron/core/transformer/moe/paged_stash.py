@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any
 
@@ -13,7 +14,11 @@ from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
     GLOBAL_MAX_BLOCKS,
     paged_stash_copy_kernel,
+    paged_stash_copy_mx_kernel,
+    paged_stash_copy_page_kernel,
     paged_stash_pop_kernel,
+    paged_stash_pop_mx_kernel,
+    paged_stash_pop_page_kernel,
 )
 from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
 from megatron.core.utils import get_attr_wrapped_model
@@ -25,6 +30,47 @@ logger = logging.getLogger(__name__)
 _MAX_RERUN_ATTEMPTS = 2
 
 SCALE_INV_BLOCK_SIZE = 32
+
+# MLPERF_STASH_PAGE_COPY=1 copies whole pages in contiguous chunks (bit-identical results).
+_PAGE_COPY = os.environ.get("MLPERF_STASH_PAGE_COPY", "0") == "1"
+# Target bytes per chunk and programs per launch for the page-copy kernels.
+_PAGE_CHUNK_BYTES = int(os.environ.get("MLPERF_STASH_PAGE_CHUNK_BYTES", "16384"))
+_PAGE_MAX_PROGRAMS = int(os.environ.get("MLPERF_STASH_PAGE_MAX_PROGRAMS", "4096"))
+_PAGE_NUM_WARPS = int(os.environ.get("MLPERF_STASH_PAGE_NUM_WARPS", "4"))
+# MLPERF_STASH_ACT_MXFP8=1 stores BF16 stashed activations (the fused grouped MLP's SwiGLU input)
+# as MXFP8 rows [H E4M3 | H/32 E8M0] and decodes them on reload. Lossy: about half the bytes.
+_ACT_MXFP8 = os.environ.get("MLPERF_STASH_ACT_MXFP8", "0") == "1"
+_MX_MAX_PROGRAMS = int(os.environ.get("MLPERF_STASH_MX_MAX_PROGRAMS", "4096"))
+_MX_NUM_WARPS = int(os.environ.get("MLPERF_STASH_MX_NUM_WARPS", "8"))
+
+
+def _is_mx_stash(dtype, hidden_size, buffer):
+    """Whether a BF16 activation is stashed compressed in this buffer."""
+    return (
+        dtype == torch.bfloat16
+        and buffer.dtype == torch.uint8
+        and buffer.hidden_size == hidden_size + hidden_size // 32
+    )
+
+
+def _mx_launch(page_size, hidden_size, max_rows):
+    """Rows per work item (a power of two dividing the page) and grid for the MXFP8 kernels."""
+    rows = 1
+    while rows * 2 <= page_size and rows * 2 * hidden_size <= 8192:
+        rows *= 2
+    max_pages = (max_rows + page_size - 1) // page_size
+    return rows, (max(1, min(max_pages * (page_size // rows), _MX_MAX_PROGRAMS)),)
+
+
+def _page_launch(page_size, hidden_size, element_size, max_rows):
+    """Chunk size (elements, a power of two dividing a page) and grid for the page kernels."""
+    page_elems = page_size * hidden_size
+    chunk = 1
+    while chunk * 2 <= max(_PAGE_CHUNK_BYTES // element_size, 1) and page_elems % (chunk * 2) == 0:
+        chunk *= 2
+    max_pages = (max_rows + page_size - 1) // page_size
+    max_work = max_pages * (page_elems // chunk)
+    return chunk, (max(1, min(max_work, _PAGE_MAX_PROGRAMS)),)
 
 
 class PagedStashBuffer:
@@ -207,23 +253,28 @@ class PagedTensor:
         ``block_size`` is the number of elements each program copies per inner-loop iteration
         (a power of two) and ``max_blocks`` the maximum number of programs per launch.
         """
-        # Zero uninitialized metadata before copy kernel (enqueued on current stream;
-        # stash_paged_tensors runs offload on the pack stream).
-        self.page_record.zero_()
-        self.spilled_to_host.zero_()
+        # The copy kernel writes every page_record slot that the pop kernel reads and always
+        # writes spilled_to_host, so the metadata needs no zeroing beforehand.
         self._tensor = self._tensor.contiguous()
         if self.num_tokens_tensor.dim() == 0:
             self.num_tokens_tensor = self.num_tokens_tensor.reshape(1)
+        # The kernel divides the token count for columnwise scales itself.
+        num_tokens_tensor = self.num_tokens_tensor
         if self.is_columnwise_scale_inv:
-            num_tokens_tensor = self.num_tokens_tensor // SCALE_INV_BLOCK_SIZE
+            num_tokens_div = SCALE_INV_BLOCK_SIZE
             max_num_tokens = self.max_num_tokens // SCALE_INV_BLOCK_SIZE
         else:
-            num_tokens_tensor = self.num_tokens_tensor
+            num_tokens_div = 1
             max_num_tokens = self.max_num_tokens
 
         tensor_to_copy = self._tensor
         num_blocks = min(max_num_tokens, max_blocks)
         grid = (num_blocks,)
+        if _PAGE_COPY:
+            chunk, page_grid = _page_launch(
+                self.page_size, self.hidden_size, paged_stash_buffer.cuda_buffer.element_size(),
+                max_num_tokens,
+            )
 
         new_free_list_head = torch.empty(2, dtype=torch.int64, device=self.device)
         has_host = 1 if paged_stash_buffer.host_buffer is not None else 0
@@ -233,26 +284,74 @@ class PagedTensor:
             else paged_stash_buffer.cuda_buffer
         )
 
-        paged_stash_copy_kernel[grid](
-            tensor_to_copy.view(paged_stash_buffer.cuda_buffer.dtype),
-            paged_stash_buffer.cuda_buffer,
-            host_dst,
-            num_tokens_tensor,
-            paged_stash_buffer.free_list_cuda,
-            paged_stash_buffer.free_list_host,
-            paged_stash_buffer.free_list_head,
-            paged_stash_buffer.free_list_tail,
-            paged_stash_buffer.free_list_capacity,
-            self.page_record,
-            paged_stash_buffer.overflow,
-            paged_stash_buffer.host_spill,
-            self.spilled_to_host,
-            new_free_list_head,
-            PAGE_SIZE=self.page_size,
-            HIDDEN_SIZE=self.hidden_size,
-            BLOCK_SIZE=block_size,
-            HAS_HOST_BUFFER=has_host,
-        )
+        if _is_mx_stash(self.dtype, self.hidden_size, paged_stash_buffer):
+            mx_rows, mx_grid = _mx_launch(self.page_size, self.hidden_size, max_num_tokens)
+            paged_stash_copy_mx_kernel[mx_grid](
+                tensor_to_copy,
+                paged_stash_buffer.cuda_buffer,
+                host_dst,
+                num_tokens_tensor,
+                paged_stash_buffer.free_list_cuda,
+                paged_stash_buffer.free_list_host,
+                paged_stash_buffer.free_list_head,
+                paged_stash_buffer.free_list_tail,
+                paged_stash_buffer.free_list_capacity,
+                self.page_record,
+                paged_stash_buffer.overflow,
+                paged_stash_buffer.host_spill,
+                self.spilled_to_host,
+                new_free_list_head,
+                PAGE_SIZE=self.page_size,
+                HIDDEN_SIZE=self.hidden_size,
+                ROWS=mx_rows,
+                HAS_HOST_BUFFER=has_host,
+                num_warps=_MX_NUM_WARPS,
+            )
+        elif _PAGE_COPY:
+            paged_stash_copy_page_kernel[page_grid](
+                tensor_to_copy.view(paged_stash_buffer.cuda_buffer.dtype),
+                paged_stash_buffer.cuda_buffer,
+                host_dst,
+                num_tokens_tensor,
+                paged_stash_buffer.free_list_cuda,
+                paged_stash_buffer.free_list_host,
+                paged_stash_buffer.free_list_head,
+                paged_stash_buffer.free_list_tail,
+                paged_stash_buffer.free_list_capacity,
+                self.page_record,
+                paged_stash_buffer.overflow,
+                paged_stash_buffer.host_spill,
+                self.spilled_to_host,
+                new_free_list_head,
+                PAGE_SIZE=self.page_size,
+                HIDDEN_SIZE=self.hidden_size,
+                CHUNK=chunk,
+                HAS_HOST_BUFFER=has_host,
+                NUM_TOKENS_DIV=num_tokens_div,
+                num_warps=_PAGE_NUM_WARPS,
+            )
+        else:
+            paged_stash_copy_kernel[grid](
+                tensor_to_copy.view(paged_stash_buffer.cuda_buffer.dtype),
+                paged_stash_buffer.cuda_buffer,
+                host_dst,
+                num_tokens_tensor,
+                paged_stash_buffer.free_list_cuda,
+                paged_stash_buffer.free_list_host,
+                paged_stash_buffer.free_list_head,
+                paged_stash_buffer.free_list_tail,
+                paged_stash_buffer.free_list_capacity,
+                self.page_record,
+                paged_stash_buffer.overflow,
+                paged_stash_buffer.host_spill,
+                self.spilled_to_host,
+                new_free_list_head,
+                PAGE_SIZE=self.page_size,
+                HIDDEN_SIZE=self.hidden_size,
+                BLOCK_SIZE=block_size,
+                HAS_HOST_BUFFER=has_host,
+                NUM_TOKENS_DIV=num_tokens_div,
+            )
         paged_stash_buffer.free_list_head.copy_(new_free_list_head)
         self._original_tensor = self._tensor
         self._tensor = None
@@ -277,14 +376,20 @@ class PagedTensor:
         )
         assert self._tensor.dtype == self.dtype and self._tensor.device == self.device
 
+        num_tokens_tensor = self.num_tokens_tensor
         if self.is_columnwise_scale_inv:
-            num_tokens_tensor = self.num_tokens_tensor // SCALE_INV_BLOCK_SIZE
+            num_tokens_div = SCALE_INV_BLOCK_SIZE
             max_num_tokens = self.max_num_tokens // SCALE_INV_BLOCK_SIZE
         else:
-            num_tokens_tensor = self.num_tokens_tensor
+            num_tokens_div = 1
             max_num_tokens = self.max_num_tokens
         num_blocks = min(max_num_tokens, max_blocks)
         grid = (num_blocks,)
+        if _PAGE_COPY:
+            chunk, page_grid = _page_launch(
+                self.page_size, self.hidden_size, paged_stash_buffer.cuda_buffer.element_size(),
+                max_num_tokens,
+            )
 
         new_free_list_tail = torch.empty(2, dtype=torch.int64, device=self.device)
         host_src = (
@@ -292,23 +397,65 @@ class PagedTensor:
             if paged_stash_buffer.host_buffer is not None
             else paged_stash_buffer.cuda_buffer
         )
-        paged_stash_pop_kernel[grid](
-            paged_stash_buffer.cuda_buffer,
-            host_src,
-            self._tensor.view(paged_stash_buffer.cuda_buffer.dtype),
-            num_tokens_tensor,
-            self.page_record,
-            self.spilled_to_host,
-            paged_stash_buffer.overflow,
-            paged_stash_buffer.free_list_cuda,
-            paged_stash_buffer.free_list_host,
-            paged_stash_buffer.free_list_tail,
-            paged_stash_buffer.free_list_capacity,
-            new_free_list_tail,
-            PAGE_SIZE=self.page_size,
-            HIDDEN_SIZE=self.hidden_size,
-            BLOCK_SIZE=block_size,
-        )
+        if _is_mx_stash(self.dtype, self.hidden_size, paged_stash_buffer):
+            mx_rows, mx_grid = _mx_launch(self.page_size, self.hidden_size, max_num_tokens)
+            paged_stash_pop_mx_kernel[mx_grid](
+                paged_stash_buffer.cuda_buffer,
+                host_src,
+                self._tensor,
+                num_tokens_tensor,
+                self.page_record,
+                self.spilled_to_host,
+                paged_stash_buffer.overflow,
+                paged_stash_buffer.free_list_cuda,
+                paged_stash_buffer.free_list_host,
+                paged_stash_buffer.free_list_tail,
+                paged_stash_buffer.free_list_capacity,
+                new_free_list_tail,
+                PAGE_SIZE=self.page_size,
+                HIDDEN_SIZE=self.hidden_size,
+                ROWS=mx_rows,
+                num_warps=_MX_NUM_WARPS,
+            )
+        elif _PAGE_COPY:
+            paged_stash_pop_page_kernel[page_grid](
+                paged_stash_buffer.cuda_buffer,
+                host_src,
+                self._tensor.view(paged_stash_buffer.cuda_buffer.dtype),
+                num_tokens_tensor,
+                self.page_record,
+                self.spilled_to_host,
+                paged_stash_buffer.overflow,
+                paged_stash_buffer.free_list_cuda,
+                paged_stash_buffer.free_list_host,
+                paged_stash_buffer.free_list_tail,
+                paged_stash_buffer.free_list_capacity,
+                new_free_list_tail,
+                PAGE_SIZE=self.page_size,
+                HIDDEN_SIZE=self.hidden_size,
+                CHUNK=chunk,
+                NUM_TOKENS_DIV=num_tokens_div,
+                num_warps=_PAGE_NUM_WARPS,
+            )
+        else:
+            paged_stash_pop_kernel[grid](
+                paged_stash_buffer.cuda_buffer,
+                host_src,
+                self._tensor.view(paged_stash_buffer.cuda_buffer.dtype),
+                num_tokens_tensor,
+                self.page_record,
+                self.spilled_to_host,
+                paged_stash_buffer.overflow,
+                paged_stash_buffer.free_list_cuda,
+                paged_stash_buffer.free_list_host,
+                paged_stash_buffer.free_list_tail,
+                paged_stash_buffer.free_list_capacity,
+                new_free_list_tail,
+                PAGE_SIZE=self.page_size,
+                HIDDEN_SIZE=self.hidden_size,
+                BLOCK_SIZE=block_size,
+                NUM_TOKENS_DIV=num_tokens_div,
+            )
 
         paged_stash_buffer.free_list_tail.copy_(new_free_list_tail)
 
@@ -641,9 +788,13 @@ class PagedStashManager:
             buf_dtype = (
                 torch.uint8 if dtype in [torch.float8_e4m3fn, torch.float8_e8m0fnu] else dtype
             )
+            buf_hidden = hidden_size
+            if _ACT_MXFP8 and dtype == torch.bfloat16 and hidden_size % 32 == 0:
+                buf_dtype = torch.uint8
+                buf_hidden = hidden_size + hidden_size // 32
             self.stash_buffers[dtype][hidden_size] = PagedStashBuffer(
                 num_tokens,
-                hidden_size,
+                buf_hidden,
                 self.page_size,
                 self.device,
                 self.overflow,

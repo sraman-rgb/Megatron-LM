@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import os
 import weakref
 from contextlib import contextmanager
 from typing import Optional
@@ -24,6 +25,10 @@ from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers, partition_buckets
 
 logger = logging.getLogger(__name__)
+
+# overlay_rstail: gated knobs; unset = container behaviour.
+_RSTAIL_AG_FWD = os.environ.get("MLPERF_RSTAIL_AG_FWD", "0") == "1"
+_RSTAIL_NOBUCKET = os.environ.get("MLPERF_RSTAIL_NOBUCKET", "0") == "1"
 
 
 class _BucketParamReadyCallback:
@@ -167,7 +172,11 @@ class DistributedDataParallel(_BaseDataParallel):
             pp_rank = self.pp_group[0].rank()
         else:
             pp_rank = self.pp_group.rank()
-        if disable_bucketing or pp_rank > 0:
+        if disable_bucketing or pp_rank > 0 or _RSTAIL_NOBUCKET:
+            # overlay_rstail (MLPERF_RSTAIL_NOBUCKET=1): no bucketing on PP stage 0 chunk 0 either.
+            # Every other chunk already has one bucket per buffer; with full-iteration CUDA graphs
+            # the chunk's buckets all become ready at its last backward anyway, so the serial
+            # per-bucket reduce-scatters / all-gathers only add per-collective latency.
             self.bucket_size = None
 
         self.param_to_bucket_group = {}
@@ -652,7 +661,16 @@ class DistributedDataParallel(_BaseDataParallel):
             if self.overlap_param_gather_with_optimizer_step and not force_dispatch:
                 return
 
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        bucket_groups = self.bucket_groups + self.expert_parallel_bucket_groups
+        if _RSTAIL_AG_FWD and not force_sync:
+            # overlay_rstail (MLPERF_RSTAIL_AG_FWD=1): dispatch the bucketed all-gathers in forward
+            # order. Buckets are laid out from the end of the model, so the default order gathers
+            # the embedding / first layers last and the first forward of PP stage 0 waits for every
+            # bucket of its chunk. Same collectives, same data; only the dispatch order changes.
+            bucket_groups = list(reversed(self.bucket_groups)) + list(
+                reversed(self.expert_parallel_bucket_groups)
+            )
+        for bucket_group in bucket_groups:
             self._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
 
     def reset_param_sync_dispatch_state(self):

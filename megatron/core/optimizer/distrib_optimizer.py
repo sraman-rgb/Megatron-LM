@@ -3,6 +3,7 @@
 """Megatron distributed optimizer."""
 
 import gc
+import os
 import itertools
 import logging
 from collections import ChainMap
@@ -14,6 +15,63 @@ import torch
 import torch.nn.functional
 
 from megatron.core.utils import log_single_rank
+
+_OPTFUSE_GRADCOPY = os.getenv("MLPERF_OPTFUSE_GRADCOPY", "0") == "1"
+_OPTFUSE_GRADCOPY_GAP = int(os.getenv("MLPERF_OPTFUSE_GRADCOPY_GAP", "65536"))
+_OPTFUSE_DEBUG = os.getenv("MLPERF_OPTFUSE_DEBUG", "0") == "1"
+_optfuse_lib_handle = None
+_optfuse_sms = None
+
+
+def _optfuse_lib():
+    global _optfuse_lib_handle
+    if _optfuse_lib_handle is None:
+        import ctypes
+
+        path = os.getenv("MLPERF_OPTFUSE_LIB")
+        if not path:
+            try:
+                import transformer_engine.pytorch.tensor as _tet
+
+                path = os.path.join(os.path.dirname(os.path.abspath(_tet.__file__)), "liboptfuse.so")
+            except ImportError:
+                path = "liboptfuse.so"
+        try:
+            lib = ctypes.CDLL(path)
+            lib.optfuse_bf16_to_f32.restype = ctypes.c_int
+            _optfuse_lib_handle = lib
+        except (OSError, AttributeError):
+            _optfuse_lib_handle = False
+    return _optfuse_lib_handle
+
+
+def _optfuse_bf16_to_f32(ref, lo, hi):
+    """FP32 copy of ref's storage elements [lo, hi) (bf16), via one vectorized kernel over the
+    8-element-aligned superset [lo8, hi8); returns the [lo, hi) view, or None if not applicable."""
+    global _optfuse_sms
+    import ctypes
+
+    if ref.dtype != torch.bfloat16:
+        return None
+    lib = _optfuse_lib()
+    if not lib:
+        return None
+    lo8, hi8 = lo - lo % 8, (hi + 7) // 8 * 8
+    if hi8 * 2 > ref.untyped_storage().nbytes() or ref.untyped_storage().data_ptr() % 16 != 0:
+        return None
+    if _optfuse_sms is None:
+        _optfuse_sms = torch.cuda.get_device_properties(ref.device).multi_processor_count
+    src = ref.as_strided((hi8 - lo8,), (1,), lo8)
+    out = torch.empty(hi8 - lo8, dtype=torch.float32, device=ref.device)
+    rc = lib.optfuse_bf16_to_f32(
+        ctypes.c_void_p(src.data_ptr()),
+        ctypes.c_void_p(out.data_ptr()),
+        ctypes.c_int64((hi8 - lo8) // 8),
+        ctypes.c_int(_optfuse_sms),
+        ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
+    )
+    assert rc == 0, f"optfuse_bf16_to_f32 failed ({rc})"
+    return out[lo - lo8 : hi - lo8]
 
 from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
 
@@ -2806,9 +2864,80 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             copy_group_grads(self.model_float16_groups, self.shard_float16_groups)
             copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)
+        elif _OPTFUSE_GRADCOPY:
+            self._optfuse_copy_grads()
         else:
             copy_group_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)
             copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)
+
+    def _optfuse_copy_grads(self):
+        """overlay_optfuse (MLPERF_OPTFUSE_GRADCOPY=1): same FP32 main grads as
+        ``shard_main_param.grad = shard_model_grad.float()`` per param, but converted with one
+        contiguous bf16->fp32 cast per run of adjacent shards in the grad buffer (normally one per
+        bucket shard) instead of one strided/unaligned cast kernel per parameter. Each main param's
+        grad is a view into the run's FP32 tensor. The conversion is exact, so bit-identical."""
+        plan = getattr(self, "_optfuse_grad_plan", None)
+        if plan is None:
+            entries = []
+            for model_groups, shard_main_groups in (
+                (self.model_float16_groups, self.shard_fp32_from_float16_groups),
+                (self.model_fp32_groups, self.shard_fp32_groups),
+            ):
+                for model_group, shard_main_group in zip(model_groups, shard_main_groups):
+                    for model_param, shard_main_param in zip(model_group, shard_main_group):
+                        param_range = self._get_model_param_range_map(model_param)["param"]
+                        assert param_range.size == shard_main_param.nelement()
+                        model_grad = model_param.main_grad
+                        shard = model_grad.view(-1)[param_range.start : param_range.end]
+                        entries.append(
+                            (
+                                shard.untyped_storage().data_ptr(),
+                                shard.dtype,
+                                shard.storage_offset(),
+                                shard.numel(),
+                                shard_main_param,
+                                model_param,
+                                param_range.start,
+                                param_range.end,
+                            )
+                        )
+            entries.sort(key=lambda e: (e[0], str(e[1]), e[2]))
+            runs = []  # [lo, hi, [(entry, ...)]]
+            for e in entries:
+                if e[1] == torch.float32:
+                    runs.append([None, None, [e]])  # .float() is a no-op view: keep per param
+                    continue
+                if (
+                    runs
+                    and runs[-1][0] is not None
+                    and runs[-1][2][-1][0] == e[0]
+                    and runs[-1][2][-1][1] == e[1]
+                    and 0 <= e[2] - runs[-1][1] <= _OPTFUSE_GRADCOPY_GAP
+                ):
+                    runs[-1][1] = e[2] + e[3]
+                    runs[-1][2].append(e)
+                else:
+                    runs.append([e[2], e[2] + e[3], [e]])
+            plan = runs
+            self._optfuse_grad_plan = plan
+            if _OPTFUSE_DEBUG and torch.distributed.get_rank() == 0:
+                print(
+                    f"[optfuse] grad copy: {len(entries)} params -> {len(runs)} runs",
+                    flush=True,
+                )
+        for lo, hi, es in plan:
+            if lo is None:
+                e = es[0]
+                shard = e[5].main_grad.view(-1)[e[6] : e[7]]
+                e[4].grad = shard.float()
+                continue
+            # Re-derive the base from the current main_grad (same storage, absolute offset).
+            ref = es[0][5].main_grad
+            flat = _optfuse_bf16_to_f32(ref, lo, hi)
+            if flat is None:
+                flat = ref.as_strided((hi - lo,), (1,), lo).float()
+            for e in es:
+                e[4].grad = flat[e[2] - lo : e[2] - lo + e[3]]
 
     def _copy_main_params_to_model_params(self):
         """
@@ -2946,10 +3075,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             raise NotImplementedError(
                 "_copy_main_params_to_param_buffer not supported for Megatron-FSDP."
             )
+        # MLPERF_FP4_DENSE_MXFP8_PARAMS=1: MXFP8 dense params share the grad buffer for their
+        # all-gather; NVFP4 expert params do not.
+        mixed_mxfp8_nvfp4 = os.environ.get("MLPERF_FP4_DENSE_MXFP8_PARAMS", "0") == "1"
         for shard_main_group, model_group in zip(
             self.shard_fp32_from_float16_groups, self.model_float16_groups
         ):
             for shard_main_param, model_param in zip(shard_main_group, model_group):
+                if mixed_mxfp8_nvfp4 and (
+                    is_nvfp4tensor(model_param) or self._is_grouped_nvfp4_param(model_param)
+                ):
+                    # NVFP4 params keep a persistent packed param_data; quantized below.
+                    continue
                 # Get position in param buffer
                 param_range_map = self._get_model_param_range_map(model_param)
                 world_range = param_range_map["gbuf_world_in_bucket"]
@@ -2962,6 +3099,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 shard_param_buffer = param_buffer.view(-1)[world_range.start : world_range.end]
 
                 shard_param_buffer.copy_(shard_main_param)
+
+        if mixed_mxfp8_nvfp4 and self.ddp_config.fp4_param_gather:
+            # Quantize FP32 master shards back to the NVFP4 model params (rowwise only), as
+            # _copy_main_params_to_model_params does when grad-buffer reuse is off.
+            quantize_nvfp4_param_shard(
+                *self._get_nvfp4_params_and_shard_fp32_from_nvfp4(), self.data_parallel_group
+            )
 
         # Staging params into the DDP param buffer invalidates any prior "already
         # dispatched" state. The next forward pre-hook must run post-sync cleanup,

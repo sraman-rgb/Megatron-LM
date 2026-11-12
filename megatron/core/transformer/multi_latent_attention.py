@@ -61,6 +61,19 @@ except:
     fused_apply_mla_rope_for_kv = None
     fused_apply_mla_rope_for_q = None
 
+try:
+    # MLPERF_MLA_ROPE2=1: v2 q / kv RoPE + MXFP8 kernels (overlay_mlarope2); does nothing when unset.
+    from megatron.core.fusions import fused_mla_rope2 as _mla_rope2
+except ImportError:
+    _mla_rope2 = None
+
+try:
+    # MLPERF_CASTFUSE=1: q / kv up-proj grad_output written as MXFP8 by the RoPE backward (overlay_castfuse);
+    # does nothing when unset.
+    from megatron.core.fusions import fused_castfuse as _castfuse
+except ImportError:
+    _castfuse = None
+
 
 if HAVE_TE:
     import transformer_engine_torch as tex
@@ -191,6 +204,9 @@ def _is_mxfp8_attention_active() -> bool:
     if int(os.getenv("NVTE_FP8_DPA_BWD", "1")) == 0:
         return False
     recipe = FP8GlobalStateManager.get_fp8_recipe()
+    if (recipe.nvfp4() or recipe.custom()) and recipe.fp8_dpa:
+        # FP4 linears with MXFP8 attention.
+        return os.getenv("NVTE_DPA_FP8_RECIPE", "") == "MXFP8BlockScaling"
     return recipe.mxfp8() and recipe.fp8_dpa
 
 
@@ -1088,10 +1104,12 @@ class MLASelfAttention(MultiLatentAttention):
                     q, _ = self.linear_q_proj(q_compressed)
 
                 # q: [num_tokens, n, q_head_dim]
+                q_up_out = q
                 q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
             kv, _ = self.linear_kv_up_proj(_up_proj_input(self.linear_kv_up_proj, kv_compressed))
+            kv_up_out = kv
 
             # kv: [num_tokens, n, (qk_head_dim + v_head_dim)]
             kv = kv.view(
@@ -1117,6 +1135,66 @@ class MLASelfAttention(MultiLatentAttention):
                 and k_pos_emb.dtype == torch.bfloat16
                 and _is_mxfp8_attention_active()
             )
+            if (
+                use_fused_kv_rope_quant
+                and not use_fused_q_uproj
+                and _mla_rope2 is not None
+                and _mla_rope2.available()
+                and _mla_rope2.supported(q, kv, k_pos_emb, rotary_pos_cos, rotary_pos_sin)
+            ):
+                # Same bytes as the branch below (including mxfp8_transpose_swizzle's scale
+                # layout), from two kernels that read q and kv once.
+                if (
+                    _castfuse is not None
+                    and _castfuse.ENABLED
+                    and self.config.q_lora_rank is not None
+                    and _castfuse.supported(
+                        q_up_out,
+                        kv_up_out,
+                        k_pos_emb,
+                        rotary_pos_cos,
+                        rotary_pos_sin,
+                        self.num_attention_heads_per_partition,
+                    )
+                ):
+                    # Same forward; the backward returns the up-projections' grad_output already
+                    # in MXFP8 (RoPE / split backward fused with the cast), bit-identical.
+                    quantized_query = _castfuse.QUpRoPEQuant.apply(
+                        q_up_out,
+                        rotary_pos_cos,
+                        rotary_pos_sin,
+                        self.num_attention_heads_per_partition,
+                        self.config.qk_head_dim,
+                        self.config.qk_pos_emb_head_dim,
+                    )
+                    key, value = _castfuse.KVUpRoPEQuant.apply(
+                        kv_up_out,
+                        k_pos_emb,
+                        rotary_pos_cos,
+                        rotary_pos_sin,
+                        self.num_attention_heads_per_partition,
+                        self.config.qk_pos_emb_head_dim,
+                        self.config.qk_head_dim,
+                        self.config.v_head_dim,
+                    )
+                    return quantized_query, key, value
+                quantized_query = _mla_rope2.QRoPEQuant.apply(
+                    q,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    self.config.qk_head_dim,
+                    self.config.qk_pos_emb_head_dim,
+                )
+                key, value = _mla_rope2.KVRoPEQuant.apply(
+                    kv,
+                    k_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    self.config.qk_pos_emb_head_dim,
+                    self.config.qk_head_dim,
+                    self.config.v_head_dim,
+                )
+                return quantized_query, key, value
             if use_fused_kv_rope_quant:
                 # RoPE'd q quantized as attention would; k and v split, RoPE'd and quantized in
                 # one kernel. Same MXFP8 q/k/v as the unfused path gives attention.

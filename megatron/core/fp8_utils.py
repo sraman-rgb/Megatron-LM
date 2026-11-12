@@ -737,6 +737,9 @@ def is_mxfp8_output_proj_active(config) -> bool:
         return False
     if not getattr(config, "fp8_output_proj", False):
         return False
+    # FP4 models run the LM head under its own MXFP8 autocast.
+    if getattr(config, "fp4", False):
+        return True
     if not getattr(config, "fp8", False):
         return False
 
@@ -819,7 +822,9 @@ if HAVE_TE:
         communication payload).
 
         Arguments:
-            a2a_dtype (str): Wire dtype, 'bf16' (returns None) or 'mxfp8'.
+            a2a_dtype (str): Wire dtype, 'bf16' (returns None), 'mxfp8' or 'nvfp4'. For 'nvfp4'
+                TE packs the rows to NVFP4 for the wire (stochastic rounding for the combine
+                backward grad) and decodes them back to BF16 on the receiver.
         """
         if a2a_dtype == 'bf16':
             return None
@@ -827,6 +832,8 @@ if HAVE_TE:
             return transformer_engine.common.recipe.MXFP8BlockScaling(
                 fp8_format=transformer_engine.common.recipe.Format.E4M3
             )
+        if a2a_dtype == 'nvfp4':
+            return transformer_engine.common.recipe.NVFP4BlockScaling()
         raise ValueError(f"Unsupported a2a wire dtype: {a2a_dtype!r}.")
 
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):

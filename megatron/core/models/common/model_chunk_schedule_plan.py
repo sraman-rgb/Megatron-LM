@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from typing import Any, Callable, Optional
 
 import torch
@@ -291,6 +292,40 @@ class TransformerLayerSchedulePlan:
         return f_input, b_grad
 
 
+def _run_lone_forward(f_layer, f_input, extra_compute=None):
+    """Forward of one unpaired layer; ``extra_compute`` runs on the compute stream while the
+    layer's EP dispatch is in flight."""
+    with f_layer.get_low_precision_context():
+        f_input = f_layer.pre_dispatch_computation.forward(f_input)
+    with f_layer.get_low_precision_context():
+        f_input = f_layer.moe_dispatch.forward(f_input)
+    if extra_compute is not None:
+        extra_compute()
+    with f_layer.get_low_precision_context():
+        f_input = f_layer.mlp.forward(f_input)
+    with f_layer.get_low_precision_context():
+        f_input = f_layer.moe_combine.forward(f_input)
+    with f_layer.get_low_precision_context():
+        f_input = f_layer.mtp_post_process.forward(f_input)
+    return f_input
+
+
+def _run_lone_backward(b_layer, b_grad, extra_compute=None, is_last_layer_in_bwd=False):
+    """Backward of one unpaired layer; ``extra_compute`` runs on the compute stream while the
+    layer's EP combine backward is in flight."""
+    b_grad = b_layer.mtp_post_process.backward(b_grad)
+    b_grad = b_layer.moe_combine.backward(b_grad)
+    if extra_compute is not None:
+        extra_compute()
+    b_grad = b_layer.mlp.backward(b_grad)
+    b_layer.mlp.backward_dw()
+    b_grad = b_layer.moe_dispatch.backward(b_grad)
+    b_grad = b_layer.pre_dispatch_computation.backward(b_grad)
+    if not is_last_layer_in_bwd:
+        b_layer.pre_dispatch_computation.backward_dw()
+    return b_grad
+
+
 class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     """Schedule the executing plan of the sub-modules in a model chunk sub-modules.
 
@@ -536,26 +571,72 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_schedule_plan.record_current_stream()
             f_input = f_schedule_plan.pre_process.forward()
 
-        if b_schedule_plan:
-            b_schedule_plan.record_current_stream()
-            assert b_grad is not None
-            if pre_backward is not None:
-                pre_backward(b_schedule_plan.vp_stage)
-                b_schedule_plan.record_current_stream()
-
-            if b_schedule_plan.post_process is not None:
-                b_grad = b_schedule_plan.post_process.backward(b_grad)
-
         f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
         b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
         overlapped_layers = min(f_num_layers, b_num_layers)
 
+        # MLPERF_EP_LONE_OVERLAP: when the two chunks have different layer counts, the extra
+        # ("lone") layers have no partner, so their EP dispatch/combine is exposed. Fill the first
+        # lone layer's comm window with the other chunk's post-process (LM head + loss) compute.
+        lone_overlap = os.getenv("MLPERF_EP_LONE_OVERLAP", "0") == "1"
+        defer_b_post = (
+            lone_overlap
+            and b_schedule_plan is not None
+            and b_schedule_plan.post_process is not None
+            and f_num_layers > b_num_layers
+        )
+        early_f_post = (
+            lone_overlap
+            and f_schedule_plan is not None
+            and f_schedule_plan.post_process is not None
+            and b_num_layers > f_num_layers
+        )
+
+        if b_schedule_plan:
+            b_schedule_plan.record_current_stream()
+            assert b_grad is not None
+            if pre_backward is not None:
+                if os.getenv("MLPERF_PP_BWD_WAIT_ON_COMM", "0") == "1":
+                    # The backward-grad recv only gates the backward chunk, whose first op
+                    # (combine backward) runs on the comm stream. Wait for it there instead of on
+                    # the compute stream, so the paired forward layer is not held behind it.
+                    with torch.cuda.stream(get_comm_stream()):
+                        b_schedule_plan.wait_current_stream()
+                        pre_backward(b_schedule_plan.vp_stage)
+                        b_schedule_plan.record_current_stream()
+                else:
+                    pre_backward(b_schedule_plan.vp_stage)
+                    b_schedule_plan.record_current_stream()
+
+            if b_schedule_plan.post_process is not None and not defer_b_post:
+                b_grad = b_schedule_plan.post_process.backward(b_grad)
+
         f_layer = b_layer = None
+        f_start = 0
+        if defer_b_post:
+            # Run the lone forward layers first; the deferred LM-head backward fills the first
+            # one's dispatch window. The remaining forward layers then pair with all backward
+            # layers.
+            lone_f = f_num_layers - b_num_layers
+            b_grad_box = [b_grad]
+
+            def _b_post_backward():
+                b_grad_box[0] = b_schedule_plan.post_process.backward(b_grad_box[0])
+
+            for i in range(lone_f):
+                f_layer = f_schedule_plan.get_layer(i)
+                nvtx_msg = f"layer_{i}f_lone"
+                nvtx_range_push(nvtx_msg)
+                f_input = _run_lone_forward(f_layer, f_input, _b_post_backward if i == 0 else None)
+                nvtx_range_pop(nvtx_msg)
+            b_grad = b_grad_box[0]
+            f_start = lone_f
+
         # combined forward and backward pass for overlapped layers
         for i in range(overlapped_layers):
-            f_layer = f_schedule_plan.get_layer(i)
+            f_layer = f_schedule_plan.get_layer(f_start + i)
             b_layer = b_schedule_plan.pop_layer()
-            nvtx_msg = f"layer_{i}f-layer_{b_schedule_plan.num_layers()}b"
+            nvtx_msg = f"layer_{f_start + i}f-layer_{b_schedule_plan.num_layers()}b"
             nvtx_range_push(nvtx_msg)
             f_input, b_grad = TransformerLayerSchedulePlan.run(
                 f_layer,
@@ -568,32 +649,51 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 b_layer.release_state()
             nvtx_range_pop(nvtx_msg)
 
+        f_hidden = f_input
+        f_post_done = False
+
         # backward pass for the remaining layers
         for i in range(overlapped_layers, b_num_layers):
             b_layer = b_schedule_plan.pop_layer()
             nvtx_msg = f"layer_{b_schedule_plan.num_layers()}b"
             nvtx_range_push(nvtx_msg)
-            _, b_grad = TransformerLayerSchedulePlan.run(
-                None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
-            )
+            if early_f_post and not f_post_done:
+                # The forward chunk is finished; its LM head + loss forward fills this lone
+                # backward layer's combine window.
+                f_box = [f_input]
+
+                def _f_post_forward():
+                    f_box[0] = f_schedule_plan.post_process.forward(f_box[0])
+
+                b_grad = _run_lone_backward(
+                    b_layer, b_grad, _f_post_forward, is_last_layer_in_bwd=(i == b_num_layers - 1)
+                )
+                f_input = f_box[0]
+                f_post_done = True
+            else:
+                _, b_grad = TransformerLayerSchedulePlan.run(
+                    None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
+                )
             if i < b_num_layers - 1:
                 b_layer.release_state()
             nvtx_range_pop(nvtx_msg)
 
         # forward pass for the remaining layers
-        for i in range(overlapped_layers, f_num_layers):
+        for i in range(f_start + overlapped_layers, f_num_layers):
             f_layer = f_schedule_plan.get_layer(i)
             nvtx_msg = f"layer_{i}f"
             nvtx_range_push(nvtx_msg)
             f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
             nvtx_range_pop(nvtx_msg)
+        if not f_post_done:
+            f_hidden = f_input
 
         if f_schedule_plan is not None and post_forward is not None:
             # post_forward()/send_forward_recv_forward() is running in the communication stream,
             # so the p2p comm could be overlapped with the pre_dispatch backward
             with torch.cuda.stream(get_comm_stream()):
                 f_schedule_plan.wait_current_stream()
-                post_forward(f_input, f_schedule_plan.vp_stage)
+                post_forward(f_hidden, f_schedule_plan.vp_stage)
 
         # post_backward()/send_backward_recv_backward() is running in the computation stream,
         # so the p2p comm could be overlapped with the wgrad of pre_dispatch backward
@@ -609,7 +709,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_layer.release_state()
 
         # post process forward
-        if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
+        if (
+            f_schedule_plan is not None
+            and f_schedule_plan.post_process is not None
+            and not f_post_done
+        ):
             f_input = f_schedule_plan.post_process.forward(f_input)
         # pre process backward
         if b_schedule_plan is not None:

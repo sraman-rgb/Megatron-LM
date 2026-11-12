@@ -2,6 +2,7 @@
 
 import logging
 import math
+import os
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -717,6 +718,9 @@ class TransformerConfig(ModelParallelConfig):
     fp4_recipe: Optional[Literal['nvfp4', 'custom']] = "nvfp4"
     """If set, enables the use of FP4 precision through Transformer Engine. Currently only
     'nvfp4' is supported which uses NVFP4BlockScaling recipe for Blackwell+ architecture."""
+
+    fp4_recipe_attrs: Optional[dict] = None
+    """Attributes to set in the FP4 recipe."""
 
     fp4_param: bool = field(
         default=False, metadata={"argparse_meta": {"arg_names": ["--fp4-param-gather"]}}
@@ -1763,9 +1767,9 @@ class TransformerConfig(ModelParallelConfig):
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
 
-        if self.fp8_output_proj:
+        if self.fp8_output_proj and not self.fp4:
             if not self.fp8:
-                raise ValueError("fp8_output_proj must be used together with fp8 mode.")
+                raise ValueError("fp8_output_proj must be used together with fp8 or fp4 mode.")
             if self.fp8_recipe != Fp8Recipe.mxfp8:
                 raise ValueError(
                     f"fp8_output_proj requires fp8_recipe='mxfp8', got " f"'{self.fp8_recipe}'."
@@ -3703,9 +3707,15 @@ class MLATransformerConfig(TransformerConfig):
                 "backward does not support dropout."
             )
 
+        # FP4 runs attention in MXFP8 when NVTE_DPA_FP8_RECIPE=MXFP8BlockScaling.
+        fp4_mxfp8_attention = (
+            bool(self.fp4) and os.getenv("NVTE_DPA_FP8_RECIPE", "") == "MXFP8BlockScaling"
+        )
         if self.use_fused_mla_kv_rope_quant and (
-            self.fp8 is None
-            or self.fp8_recipe != Fp8Recipe.mxfp8
+            (
+                not fp4_mxfp8_attention
+                and (self.fp8 is None or self.fp8_recipe != Fp8Recipe.mxfp8)
+            )
             or not self.fp8_dot_product_attention
             or self.attention_dropout != 0.0
         ):

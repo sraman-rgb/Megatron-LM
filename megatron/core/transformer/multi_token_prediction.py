@@ -1,6 +1,7 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
+import os
 import inspect
 import warnings
 from contextlib import AbstractContextManager, nullcontext
@@ -16,6 +17,7 @@ from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layo
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
+from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
@@ -667,6 +669,37 @@ def _mtp_logits_are_vocab_sharded(
     return not getattr(output_layer, "gather_output", False)
 
 
+# MLPERF_CE1P=1 (overlay_ce1p): the backward of the eh_proj input concat splits the gradient into two
+# contiguous halves with one 16-byte-vector copy kernel (libce1p.so, ~28 us per microbatch at 4096 x 7168 on
+# VR200). torch.cat's backward hands the two norms strided views, which they copy with a strided elementwise
+# kernel (2 x ~76-80 us). The forward stays torch.cat.
+_MTP_CE1P = os.getenv("MLPERF_CE1P", "0") == "1"
+
+
+class _Cat2(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, a, b):
+        ctx.n_a = a.shape[-1]
+        return torch.cat((a, b), -1)
+
+    @staticmethod
+    def backward(ctx, grad):
+        from transformer_engine.pytorch.triton.cross_entropy import ce1p_split2
+
+        return ce1p_split2(grad, ctx.n_a)
+
+
+def _mtp_cat2(a, b):
+    if _MTP_CE1P:
+        try:
+            from transformer_engine.pytorch.triton.cross_entropy import ce1p_cat2_supported
+        except ImportError:
+            ce1p_cat2_supported = None
+        if ce1p_cat2_supported is not None and ce1p_cat2_supported(a, b):
+            return _Cat2.apply(a, b)
+    return torch.cat((a, b), -1)
+
+
 def _vocab_parallel_argmax(
     vocab_parallel_logits: Tensor, tp_group: torch.distributed.ProcessGroup, tp_size: int
 ) -> Tensor:
@@ -686,6 +719,55 @@ def _vocab_parallel_argmax(
         0
     )  # [s, b]
     return winning_rank * vocab_shard_size + winning_local_argmax  # [s, b]
+
+
+# overlay_casts (MLPERF_CASTS_MTPACC=1): the MTP acceptance counts (a logged metric) in one Triton kernel instead
+# of ~9 tiny per-microbatch kernels (2 transposes + contiguous, bool cast, eq, and, 2 sums, 2 float casts) on the
+# last PP stage. Integer counts, converted exactly to fp32 (< 2**24): bit-identical.
+_CASTS_MTPACC = os.getenv("MLPERF_CASTS_MTPACC", "0") == "1"
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _mtp_acc_kernel(
+        preds_ptr, labels_ptr, mask_ptr, correct_ptr, total_ptr, S, B,
+        ps_s, ps_b, ls_b, ls_s, ms_b, ms_s, BLOCK: tl.constexpr,
+    ):
+        acc_c = tl.zeros([BLOCK], dtype=tl.int32)
+        acc_t = tl.zeros([BLOCK], dtype=tl.int32)
+        n = S * B
+        for start in range(0, n, BLOCK):
+            i = start + tl.arange(0, BLOCK)
+            m = i < n
+            si = i // B
+            bi = i % B
+            p = tl.load(preds_ptr + si * ps_s + bi * ps_b, mask=m, other=0)
+            lab = tl.load(labels_ptr + bi * ls_b + si * ls_s, mask=m, other=0)
+            v = tl.load(mask_ptr + bi * ms_b + si * ms_s, mask=m, other=0)
+            valid = (v != 0) & m
+            acc_c += ((p == lab) & valid).to(tl.int32)
+            acc_t += valid.to(tl.int32)
+        tl.store(correct_ptr, tl.sum(acc_c, axis=0).to(tl.float32))
+        tl.store(total_ptr, tl.sum(acc_t, axis=0).to(tl.float32))
+
+    _MTPACC_TRITON = True
+except ImportError:  # pragma: no cover
+    _MTPACC_TRITON = False
+
+
+def _mtp_acceptance_counts_fused(preds: Tensor, mtp_labels: Tensor, loss_mask: Tensor):
+    """(correct, total) as fp32 0-dim tensors; preds [s, b], mtp_labels / loss_mask [b, s]."""
+    s, b = preds.shape
+    correct = torch.empty((), dtype=torch.float32, device=preds.device)
+    total = torch.empty((), dtype=torch.float32, device=preds.device)
+    mask = loss_mask.view(torch.uint8) if loss_mask.dtype == torch.bool else loss_mask
+    _mtp_acc_kernel[(1,)](
+        preds, mtp_labels, mask, correct, total, s, b,
+        preds.stride(0), preds.stride(1), mtp_labels.stride(0), mtp_labels.stride(1),
+        mask.stride(0), mask.stride(1), BLOCK=1024, num_warps=8,
+    )
+    return correct, total
 
 
 def _compute_mtp_acceptance_counts(
@@ -725,6 +807,19 @@ def _compute_mtp_acceptance_counts(
                 preds = _vocab_parallel_argmax(mtp_logits, tp_group, tp_size)
             else:
                 preds = torch.argmax(mtp_logits, dim=-1)  # [s, b]
+
+        if (
+            _CASTS_MTPACC
+            and _MTPACC_TRITON
+            and preds.dim() == 2
+            and mtp_labels.dim() == 2
+            and loss_mask.dim() == 2
+            and tuple(mtp_labels.shape) == (preds.shape[1], preds.shape[0])
+            and tuple(loss_mask.shape) == tuple(mtp_labels.shape)
+            and preds.numel() < (1 << 24)
+            and preds.is_cuda
+        ):
+            return _mtp_acceptance_counts_fused(preds, mtp_labels, loss_mask)
 
         labels_match = mtp_labels.transpose(0, 1).contiguous()  # [b, s] => [s, b]
         mask_match = loss_mask.transpose(0, 1).contiguous()  # [b, s] => [s, b]
@@ -1455,8 +1550,8 @@ class MultiTokenPredictionLayer(MegatronModule):
         """Return the quantization context for fine-grained MTP execution."""
         if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
             return get_fp8_context(self.config)
-
-        # FP4 in MTP layers still needs numerical validation.
+        if self.config.fp4:
+            return get_fp4_context(self.config)
         return nullcontext()
 
     def _get_embeddings(
@@ -1599,7 +1694,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
-            hidden_states = torch.cat((decoder_input, hidden_states), -1)
+            hidden_states = _mtp_cat2(decoder_input, hidden_states)
             hidden_states, _ = self.eh_proj(hidden_states)
             if InferenceMode.is_active():
                 hidden_states = inference_all_gather_from_tensor_model_parallel_region(
@@ -1646,6 +1741,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         if self.config.fp8:
             fp8_context = get_fp8_context(self.config)
             transformer_layer_fp8_context = get_fp8_context(self.config)
+        elif self.config.fp4:
+            fp8_context = get_fp4_context(self.config)
+            transformer_layer_fp8_context = get_fp4_context(self.config)
         else:
             fp8_context = nullcontext()
             transformer_layer_fp8_context = nullcontext()
@@ -2303,7 +2401,10 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         def build_layer_legacy(layer_spec, layer_number):
             """Build layer using legacy spec-based approach."""
-            fp8_init_context = get_fp8_context(self.config, is_init=True)
+            if self.config.fp4:
+                fp8_init_context = get_fp4_context(self.config, is_init=True)
+            else:
+                fp8_init_context = get_fp8_context(self.config, is_init=True)
             with fp8_init_context:
                 module = build_module(
                     layer_spec,
@@ -2320,7 +2421,10 @@ class MultiTokenPredictionBlock(MegatronModule):
             layer_spec, layer_number, mtp_layer_pattern, hybrid_submodules
         ):
             """Build layer using pattern-based approach (new Mamba path)."""
-            fp8_init_context = get_fp8_context(self.config, is_init=True)
+            if self.config.fp4:
+                fp8_init_context = get_fp4_context(self.config, is_init=True)
+            else:
+                fp8_init_context = get_fp8_context(self.config, is_init=True)
             with fp8_init_context:
                 module = build_module(
                     layer_spec,

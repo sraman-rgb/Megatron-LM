@@ -78,6 +78,17 @@ def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
     return sharded_buffer
 
 
+def _mixed_mxfp8_nvfp4_params() -> bool:
+    """MLPERF_FP4_DENSE_MXFP8_PARAMS=1: MXFP8 dense params next to NVFP4 expert params.
+
+    Grad-buffer reuse for the param all-gather then applies only to buffers that hold
+    MXFP8 params; NVFP4 and high-precision buffers keep their persistent param_data.
+    """
+    import os
+
+    return os.environ.get("MLPERF_FP4_DENSE_MXFP8_PARAMS", "0") == "1"
+
+
 def _param_uses_quantized_storage(param: torch.nn.Parameter) -> bool:
     """Return whether the parameter owns TE quantized storage instead of plain tensor storage."""
     # In TE2, is_float8tensor() checks QuantizedTensor, so it includes plain MXFP8Tensor.
@@ -345,7 +356,15 @@ class _ParamAndGradBucketGroup:
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            persistent_quantized_params = []
             for bucket in self.buckets:
+                if not getattr(bucket, "uses_mxfp8_grad_buf_ag", True):
+                    # Persistent param_data (NVFP4 / high precision): the all-gather wrote
+                    # in place, so only the regular post-processing is needed.
+                    persistent_quantized_params.extend(
+                        param for param in bucket.params if _param_uses_quantized_storage(param)
+                    )
+                    continue
                 if bucket.param_data is None:
                     # LayerWise variable-size gather path: params are already updated via
                     # unflatten + copy_ in finish_param_sync, and there is no param_data
@@ -376,6 +395,8 @@ class _ParamAndGradBucketGroup:
                 # correspond to multiple param buffers. If we zero out the entire grad buffer,
                 # it would clear the data of those param buffers that have not yet completed AG.
                 bucket.param_data.zero_()
+            if persistent_quantized_params:
+                post_all_gather_processing(persistent_quantized_params)
             return
 
         quantized_params = []
@@ -1244,6 +1265,12 @@ class _ParamAndGradBuffer:
         self.param_data_size = 0
         self.param_data_cpu = None
 
+        # Whether this buffer reuses grad_data for the param all-gather.
+        self.uses_mxfp8_grad_buf_ag = self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag and (
+            not _mixed_mxfp8_nvfp4_params()
+            or any(is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params)
+        )
+
         # Finally, map param.data and param.main_grad fields to buffers.
         def _create_bucket(bucket_id, bucket_params, bucket_params_with_extra_main_grads):
             """
@@ -1305,10 +1332,7 @@ class _ParamAndGradBuffer:
             #   TE GroupedTensor + NVFP4      -> remap packed rowwise bytes
             #   TE GroupedTensor + MXFP8      -> unsupported here; require grad-buffer AG reuse
             #   TE GroupedTensor + BF16/FP16  -> remap grouped rowwise_data
-            if (
-                not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-                or not _param_uses_quantized_storage(param)
-            ):
+            if not self.uses_mxfp8_grad_buf_ag or not _param_uses_quantized_storage(param):
                 if self.param_data is not None:
                     if not is_grouped_tensor(param):
                         # Plain NVFP4: remap packed rowwise bytes only.
@@ -1657,6 +1681,7 @@ class _ParamAndGradBuffer:
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket
             self.param_to_bucket[bucket_param] = bucket
+        bucket.uses_mxfp8_grad_buf_ag = self.uses_mxfp8_grad_buf_ag
 
         return bucket
 

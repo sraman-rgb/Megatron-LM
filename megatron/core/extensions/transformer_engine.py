@@ -361,6 +361,50 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
 
 
+def _fp4_dense_keep_fp4_ffn(
+    config: TransformerConfig, tp_comm_buffer_name: Optional[str], input_size: int, output_size: int
+) -> bool:
+    """Whether a dense-FFN linear keeps the FP4 recipe under ``MLPERF_FP4_DENSE_MXFP8=1``.
+
+    With ``MLPERF_FP4_DENSE_MXFP8_SKIP_FFN=1`` the large dense MLP layers (``ffn_hidden_size``
+    wide, the first dense layers of DeepSeek-V3) stay NVFP4, which keeps their primary weights
+    in FP4 instead of BF16 plus an MXFP8 copy.
+    """
+    if os.environ.get("MLPERF_FP4_DENSE_MXFP8_SKIP_FFN", "0") != "1":
+        return False
+    if tp_comm_buffer_name not in ("fc1", "fc2"):
+        return False
+    ffn = config.ffn_hidden_size
+    return output_size in (ffn, 2 * ffn) or input_size == ffn
+
+
+def _fp4_dense_mxfp8_params(
+    config: TransformerConfig, is_expert: bool, current: Optional[TEQuantizationParams]
+) -> Optional[TEQuantizationParams]:
+    """MXFP8 override for a non-expert linear of an FP4 model.
+
+    With ``MLPERF_FP4_DENSE_MXFP8=1`` the dense linears (attention, shared experts, dense MLPs,
+    MTP projections) run in MXFP8 with BF16 primary weights, while the routed experts keep the
+    model's FP4 recipe. An explicit per-module override from ``config.quant_recipe`` wins.
+    """
+    if (
+        current is not None
+        or is_expert
+        or not config.fp4
+        or os.environ.get("MLPERF_FP4_DENSE_MXFP8", "0") != "1"
+    ):
+        return current
+    return TEQuantizationParams(
+        training_recipe=TEQuantizationRecipe(
+            fp8_quantization_recipe=Fp8Recipe.mxfp8,
+            # MLPERF_FP4_DENSE_MXFP8_PARAMS=1: MXFP8 primary weights (all-gathered through the
+            # grad buffer) instead of BF16 weights plus a cached MXFP8 copy.
+            fp8_param=os.environ.get("MLPERF_FP4_DENSE_MXFP8_PARAMS", "0") == "1",
+        ),
+        evaluation_recipe=None,
+    )
+
+
 def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
     if qparams is None:
         return nullcontext()
@@ -1326,6 +1370,9 @@ class TELinear(te.pytorch.Linear):
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
+        self._fp4_dense_is_expert = is_expert or _fp4_dense_keep_fp4_ffn(
+            config, tp_comm_buffer_name, input_size, output_size
+        )
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
             self.te_quant_params, torch.is_grad_enabled()
@@ -1381,6 +1428,9 @@ class TELinear(te.pytorch.Linear):
             self.te_quant_params = None
         else:
             self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
+        self.te_quant_params = _fp4_dense_mxfp8_params(
+            self.config, getattr(self, "_fp4_dense_is_expert", True), self.te_quant_params
+        )
 
     def will_execute_quantized(self, is_context_quantized: bool) -> bool:
         """Returns whether the module is configured to execute quantized."""
@@ -1551,6 +1601,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
+        self._fp4_dense_is_expert = is_expert or _fp4_dense_keep_fp4_ffn(
+            config, tp_comm_buffer_name, input_size, output_size
+        )
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
             self.te_quant_params, torch.is_grad_enabled()
@@ -1628,6 +1681,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             self.te_quant_params = None
         else:
             self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
+        self.te_quant_params = _fp4_dense_mxfp8_params(
+            self.config, getattr(self, "_fp4_dense_is_expert", True), self.te_quant_params
+        )
 
     def will_execute_quantized(self, is_context_quantized: bool) -> bool:
         """Returns whether the module is configured to execute quantized."""
@@ -1949,7 +2005,16 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         if weight is not None and weight is not self.weight:
             raise RuntimeError("TE MXFP8 output projection does not support runtime weight.")
 
-        with get_fp8_context(self.config):
+        if self.config.fp4:
+            # FP4 models have no FP8 context; run the LM head under its own MXFP8 autocast.
+            from transformer_engine.common.recipe import Format, MXFP8BlockScaling
+
+            lm_head_context = fp8_autocast(
+                enabled=True, fp8_recipe=MXFP8BlockScaling(fp8_format=Format.E4M3)
+            )
+        else:
+            lm_head_context = get_fp8_context(self.config)
+        with lm_head_context:
             torch.cuda.nvtx.range_push("mxfp8_output_proj_telinear")
             try:
                 output_parallel, output_bias = super().forward(input_)
